@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2025 OceanBase.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,10 @@
 #include "ob_table_load_control_rpc_struct.h"
 #include "observer/table_load/ob_table_load_rpc_executor.h"
 #include "share/ob_ex_rpc.h"
+
+#ifdef IGNORE
+#undef IGNORE
+#endif
 
 namespace oceanbase
 {

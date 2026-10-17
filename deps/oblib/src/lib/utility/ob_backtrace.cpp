@@ -164,10 +164,12 @@ char *parray(char *buf, int64_t len, int64_t *array, int size)
     int64_t count = 0;
     for (int64_t i = 0; i < size; i++) {
       int64_t addr = get_rel_offset(array[i]);
+      // Windows x64: long is 32-bit; %lx would truncate 64-bit addresses.
+      // Print full 64-bit addresses so lbt can be symbolized (addr2line/symbolizer).
       if (0 == i) {
-        count = snprintf(buf + pos, len - pos, "0x%lx", addr);
+        count = snprintf(buf + pos, len - pos, "0x%llx", addr);
       } else {
-        count = snprintf(buf + pos, len - pos, " 0x%lx", addr);
+        count = snprintf(buf + pos, len - pos, " 0x%llx", addr);
       }
       if (count >= 0 && pos + count < len) {
         pos += count;

@@ -24,6 +24,11 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #else
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <processthreadsapi.h>
+#include <io.h>       // for _commit (fsync equivalent)
+#include <direct.h>   // for _mkdir
 // Windows headers
 // Prevent ERROR macro conflict - Windows defines ERROR as 0, which conflicts with log levels
 #ifdef ERROR
@@ -39,11 +44,6 @@
 #ifdef S_NORMAL
 #undef S_NORMAL
 #endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <processthreadsapi.h>
-#include <io.h>       // for _commit (fsync equivalent)
-#include <direct.h>   // for _mkdir
 // Windows doesn't have POSIX fsync(); _commit() is the equivalent for file descriptors
 #ifndef fsync
 #define fsync(fd) _commit(fd)

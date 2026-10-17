@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2025 OceanBase.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -130,6 +130,9 @@ typedef unsigned short ushort;
 
 
 
+#ifdef my_socket
+#undef my_socket
+#endif
 typedef int	File;		
 typedef int	my_socket;	
 #define INVALID_SOCKET -1

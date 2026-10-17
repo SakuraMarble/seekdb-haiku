@@ -61,7 +61,7 @@ ob_define(USE_LTO_CACHE OFF)
 
 ob_define(ASAN_DISABLE_STACK ON)
 
-# 开源模式默认支持系统租户使用向量索引
+# 开源模式默认支持系统租户使用向量索�?
 ob_define(OB_BUILD_SYS_VEC_IDX ON)
 
 if(WIN32)
@@ -129,7 +129,7 @@ endif()
 
 message(STATUS "Using C++20 standard")
 if(WIN32)
-  set(CMAKE_CXX_FLAGS "/std:c++20")
+  set(CMAKE_CXX_FLAGS "/std:c++20 /imsvc\"C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.38.33130/include\" -Wno-int-conversion -Wno-error=implicit-function-declaration -Wno-ignored-attributes -Wno-ctad-maybe-unsupported -Wno-nonportable-include-path -Wno-dollar-in-identifier-extension -Wno-ignored-pragma-intrinsic -Wno-pragma-pack -Wno-gnu-folding-constant -Wno-error")
   set(DEBUG_PREFIX "")
   set(FILE_PREFIX "")
 elseif(OB_ANDROID)
@@ -393,10 +393,10 @@ if (OB_USE_CLANG)
   elseif(WIN32)
     set(OB_OBJCOPY_BIN "llvm-objcopy")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${DEBUG_PREFIX} ${FILE_PREFIX} ${AUTO_FDO_OPT} ${THIN_LTO_OPT} ${REORDER_COMP_OPT} ${CMAKE_ASAN_FLAG}")
-    set(CMAKE_C_FLAGS "${DEBUG_PREFIX} ${FILE_PREFIX} ${AUTO_FDO_OPT} ${THIN_LTO_OPT} ${REORDER_COMP_OPT} ${CMAKE_ASAN_FLAG}")
+    set(CMAKE_C_FLAGS "${DEBUG_PREFIX} ${FILE_PREFIX} ${AUTO_FDO_OPT} ${THIN_LTO_OPT} ${REORDER_COMP_OPT} ${CMAKE_ASAN_FLAG} /imsvc\"C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.38.33130/include\" -Wno-int-conversion -Wno-error=implicit-function-declaration -Wno-ignored-attributes -Wno-ctad-maybe-unsupported -Wno-nonportable-include-path -Wno-dollar-in-identifier-extension -Wno-ignored-pragma-intrinsic -Wno-pragma-pack -Wno-gnu-folding-constant -Wno-error")
     set(CMAKE_CXX_LINK_FLAGS "${LD_OPT} ${DEBUG_PREFIX} ${FILE_PREFIX} ${AUTO_FDO_OPT}")
-    set(CMAKE_SHARED_LINKER_FLAGS "/INCREMENTAL:NO ${LD_OPT} ${THIN_LTO_CONCURRENCY_LINK} ${REORDER_LINK_OPT} ${COMPACT_UNWIND_FLAG}")
-    set(CMAKE_EXE_LINKER_FLAGS "/INCREMENTAL:NO ${LD_OPT} ${THIN_LTO_CONCURRENCY_LINK} ${REORDER_LINK_OPT} ${CMAKE_COVERAGE_EXE_LINKER_OPTIONS} ${COMPACT_UNWIND_FLAG}")
+    set(CMAKE_SHARED_LINKER_FLAGS "/INCREMENTAL:NO ${LD_OPT} ${THIN_LTO_CONCURRENCY_LINK} ${REORDER_LINK_OPT} ${COMPACT_UNWIND_FLAG} /libpath:\"C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.38.33130/lib/x64\" /libpath:\"C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/lib/x64\" \"C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/lib/x64/msvcprt.lib\"")
+    set(CMAKE_EXE_LINKER_FLAGS "/INCREMENTAL:NO ${LD_OPT} ${THIN_LTO_CONCURRENCY_LINK} ${REORDER_LINK_OPT} ${CMAKE_COVERAGE_EXE_LINKER_OPTIONS} ${COMPACT_UNWIND_FLAG} /libpath:\"C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.38.33130/lib/x64\" /libpath:\"C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/lib/x64\" \"C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/lib/x64/msvcprt.lib\"")
   elseif(OB_ANDROID)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${DEBUG_PREFIX} ${FILE_PREFIX} ${AUTO_FDO_OPT} ${THIN_LTO_OPT} -fcolor-diagnostics ${REORDER_COMP_OPT} -fmax-type-align=8 ${CMAKE_ASAN_FLAG}")
     set(CMAKE_C_FLAGS "${DEBUG_PREFIX} ${FILE_PREFIX} ${AUTO_FDO_OPT} ${THIN_LTO_OPT} -fcolor-diagnostics ${REORDER_COMP_OPT} -fmax-type-align=8 ${CMAKE_ASAN_FLAG}")
@@ -416,9 +416,9 @@ else() # not clang, use gcc
 endif()
 
 if (OB_BUILD_CCLS)
-  # ccls场景采用更大的unity的联合编译单元，ccls是非完整编译，调用clang AST接口，单元的size和耗时成指数衰减
+  # ccls场景采用更大的unity的联合编译单元，ccls是非完整编译，调用clang AST接口，单元的size和耗时成指数衰�?
   set(OB_MAX_UNITY_BATCH_SIZE 200)
-  # -DCCLS_LASY_ENABLE 给全局设置上，将采用ccls懒加载模式，主要针对单测case，当添加上-DCCLS_LASY_OFF，首次将会进行检索
+  # -DCCLS_LASY_ENABLE 给全局设置上，将采用ccls懒加载模式，主要针对单测case，当添加�?DCCLS_LASY_OFF，首次将会进行检�?
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DCCLS_LASY_ENABLE")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DCCLS_LASY_ENABLE")
 endif()

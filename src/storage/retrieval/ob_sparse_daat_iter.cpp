@@ -106,6 +106,12 @@ int ObSRDaaTIterImpl::init(
     dim_iters_ = &dim_iters;
     relevance_collector_ = &relevance_collector;
     const int64_t max_batch_size = OB_MAX(iter_param_->eval_ctx_->max_batch_size_, iter_param_->max_batch_size_);
+    // When a topk limit is pushed down (BMW/WAND), the merge iter projects the whole
+    // topk result in a single batch, which can exceed the eval ctx batch size (e.g.
+    // LIMIT 20 vs max_batch_size 16). Size the output buffers to hold the full topk
+    // so that ObSRBMWIterImpl::init() can safely expand them to top_k_count_.
+    const int64_t topk_limit = iter_param_->topk_limit_ > 0 ? iter_param_->topk_limit_ : 0;
+    const int64_t buffered_capacity = OB_MAX(max_batch_size, topk_limit);
     if (iter_param_->id_proj_expr_->datum_meta_.type_ == common::ObUInt64Type) {
       set_datum_func_ = ObISparseRetrievalMergeIter::set_datum_int;
     } else {
@@ -126,15 +132,15 @@ int ObSRDaaTIterImpl::init(
     } else if (OB_FAIL(next_round_iter_idxes_.prepare_allocate(dim_iters.count()))) {
       LOG_WARN("failed to prepare allocate next round iter idxes array", K(ret));
     } else if (FALSE_IT(buffered_domain_ids_.set_allocator(iter_allocator_))) {
-    } else if (OB_FAIL(buffered_domain_ids_.init(max_batch_size))) {
-      LOG_WARN("failed to init buffered domain ids array", K(ret));
-    } else if (OB_FAIL(buffered_domain_ids_.prepare_allocate(max_batch_size))) {
-      LOG_WARN("failed to prepare allocate buffered domain ids array", K(ret));
+    } else if (OB_FAIL(buffered_domain_ids_.init(buffered_capacity))) {
+      LOG_WARN("failed to init buffered domain ids array", K(ret), K(buffered_capacity));
+    } else if (OB_FAIL(buffered_domain_ids_.prepare_allocate(buffered_capacity))) {
+      LOG_WARN("failed to prepare allocate buffered domain ids array", K(ret), K(buffered_capacity));
     } else if (FALSE_IT(buffered_relevances_.set_allocator(iter_allocator_))) {
-    } else if (OB_FAIL(buffered_relevances_.init(max_batch_size))) {
-      LOG_WARN("failed to init buffered relevances array", K(ret));
-    } else if (OB_FAIL(buffered_relevances_.prepare_allocate(max_batch_size))) {
-      LOG_WARN("failed to prepare allocate buffered relevances array", K(ret));
+    } else if (OB_FAIL(buffered_relevances_.init(buffered_capacity))) {
+      LOG_WARN("failed to init buffered relevances array", K(ret), K(buffered_capacity));
+    } else if (OB_FAIL(buffered_relevances_.prepare_allocate(buffered_capacity))) {
+      LOG_WARN("failed to prepare allocate buffered relevances array", K(ret), K(buffered_capacity));
     } else if (OB_FAIL(merge_cmp_.init(iter_param_->id_proj_expr_->datum_meta_, &iter_domain_ids_))) {
       LOG_WARN("failed to init loser tree comparator", K(ret));
     } else if (OB_FAIL(init_merge_heap(dim_iters_->count()))) {

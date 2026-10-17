@@ -201,7 +201,7 @@ int ObDASIndexMergeIter::inner_init(ObDASIterParam &param)
     lib::ContextParam context_param;
     context_param.set_mem_attr("DASIndexMerge", ObCtxIds::DEFAULT_CTX_ID)
         .set_properties(lib::USE_TL_PAGE_OPTIONAL);
-    if (OB_UNLIKELY(merge_type_ != INDEX_MERGE_UNION)) {
+    if (OB_UNLIKELY(merge_type_ != INDEX_MERGE_UNION && merge_type_ != INDEX_MERGE_INTERSECT)) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid merge type", K(merge_type_));
     } else if (OB_FAIL(CURRENT_CONTEXT->CREATE_CONTEXT(mem_ctx_, context_param))) {
@@ -676,33 +676,40 @@ int ObDASIndexMergeIter::intersect_get_next_row()
       /* no available row, stop the entire process */
       ret = OB_ITER_END;
     } else {
-      /* find all available rows */
+      /* check whether the row of output_idx exists in every other child */
       bool all_matched = true;
+      bool any_child_end = false;
       for (int64_t i = 0; OB_SUCC(ret) && i < child_stores_.count(); i++) {
         if (output_idx == i) {
           /* skip */
         } else if (child_stores_.at(i).iter_end_ || !child_stores_.at(i).have_data()) {
-          ret = OB_ITER_END;
+          /* this child can never provide a matching row any more */
+          any_child_end = true;
+          break;
         } else if (OB_FAIL(compare(i, output_idx, cmp_ret))) {
-            LOG_WARN("index merge failed to compare row", K(i), K(output_idx), K(ret));
+          LOG_WARN("index merge failed to compare row", K(i), K(output_idx), K(ret));
         } else if (cmp_ret == 0) {
-          // FIXME: only one store will project data in intersect get next row(s).
+          /* row exists in this child, consume it */
           child_stores_.at(i).cur_idx_++;
         } else {
+          /* row of output_idx is smaller than current row of this child, cannot match */
           all_matched = false;
         }
       }
-      if (OB_SUCC(ret)) {
-        if (all_matched) {
-          /* found available row in each child store, output */
-          if (OB_FAIL(child_stores_.at(output_idx).to_expr())) {
-            LOG_WARN("index merge failed to convert row to expr", K(ret));
-          } else {
-            got_row = true;
-          }
+      if (OB_FAIL(ret)) {
+      } else if (any_child_end) {
+        /* one child has exhausted, no more intersection rows are possible */
+        ret = OB_ITER_END;
+      } else if (all_matched) {
+        /* found available row in each child store, output */
+        if (OB_FAIL(child_stores_.at(output_idx).to_expr())) {
+          LOG_WARN("index merge failed to convert row to expr", K(ret));
         } else {
-          child_stores_.at(output_idx).cur_idx_++;
+          got_row = true;
         }
+      } else {
+        /* the row of output_idx is not in every child, skip it and continue */
+        child_stores_.at(output_idx).cur_idx_++;
       }
     }
   }
@@ -713,14 +720,16 @@ int ObDASIndexMergeIter::intersect_get_next_row()
 int ObDASIndexMergeIter::intersect_get_next_rows(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
-  bool got_row = false;
+  count = 0;
+  result_buffer_.reuse();
   while (OB_SUCC(ret) && count < capacity) {
-      /* try to fill each child store */
+    /* try to fill each child store */
     int64_t output_idx = OB_INVALID_INDEX;
     int cmp_ret = 0;
     int64_t child_rows_cnt = 0;
     for (int64_t i = 0; OB_SUCC(ret) && i < child_stores_.count(); i++) {
       IndexMergeRowStore &child_store = child_stores_.at(i);
+      child_rows_cnt = 0;
       if (!child_store.have_data()) {
         if (!child_store.iter_end_) {
           ObDASIter *child_iter = child_iters_.at(i);
@@ -758,36 +767,54 @@ int ObDASIndexMergeIter::intersect_get_next_rows(int64_t &count, int64_t capacit
       /* no available row, stop the entire process */
       ret = OB_ITER_END;
     } else {
-      /* find all available rows */
+      /* check whether the row of output_idx exists in every other child */
       bool all_matched = true;
+      bool any_child_end = false;
       for (int64_t i = 0; OB_SUCC(ret) && i < child_stores_.count(); i++) {
         if (output_idx == i) {
           /* skip */
         } else if (child_stores_.at(i).iter_end_ || !child_stores_.at(i).have_data()) {
-          ret = OB_ITER_END;
+          /* this child can never provide a matching row any more */
+          any_child_end = true;
+          break;
         } else if (OB_FAIL(compare(i, output_idx, cmp_ret))) {
-            LOG_WARN("index merge failed to compare row", K(i), K(output_idx), K(ret));
+          LOG_WARN("index merge failed to compare row", K(i), K(output_idx), K(ret));
         } else if (cmp_ret == 0) {
+          /* row exists in this child, consume it */
           child_stores_.at(i).cur_idx_++;
         } else {
+          /* row of output_idx is smaller than current row of this child, cannot match */
           all_matched = false;
         }
       }
-      if (OB_SUCC(ret)) {
-        if (all_matched) {
-          /* found available row in each child store, output */
-          if (OB_FAIL(child_stores_.at(output_idx).to_expr())) {
-            LOG_WARN("index merge failed to convert row to expr", K(ret));
-          } else {
-            count += 1;
-          }
+      if (OB_FAIL(ret)) {
+      } else if (any_child_end) {
+        /* one child has exhausted, no more intersection rows are possible */
+        ret = OB_ITER_END;
+      } else if (all_matched) {
+        /* found a row present in every child, output */
+        if (OB_FAIL(child_stores_.at(output_idx).to_expr())) {
+          LOG_WARN("index merge failed to convert row to expr", K(ret));
+        } else if (OB_FAIL(save_row_to_result_buffer())) {
+          LOG_WARN("failed to save row to result buffer", K(ret));
         } else {
-          child_stores_.at(output_idx).cur_idx_++;
+          count += 1;
         }
+      } else {
+        /* the row of output_idx is not in every child, skip it and continue */
+        child_stores_.at(output_idx).cur_idx_++;
       }
     }
   }
 
+  if (OB_ITER_END == ret && count > 0) {
+    ret = OB_SUCCESS;
+  }
+  if (OB_SUCC(ret) && count > 0) {
+    if (OB_FAIL(result_buffer_.to_expr(count))) {
+      LOG_WARN("failed to convert result buffer to exprs", K(ret));
+    }
+  }
   return ret;
 }
 

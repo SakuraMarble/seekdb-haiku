@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     OceanBase Lite Windows build script - mirrors build.sh on Linux/macOS.
 
@@ -299,7 +299,7 @@ function Do-Build {
         "-DOB_USE_LLD=ON",
         "-DOB_VCPKG_DIR=$DefaultVcpkgDir",
         "-DOB_OPENSSL_DIR=$DefaultOpenSSLDir",
-        "-DOB_LLVM_DIR=$DefaultLLVMDir"
+        "-DOB_LLVM_DIR=$DefaultLLVMDir", "-DCMAKE_LINKER=$DefaultLLVMDir/bin/lld-link.exe"
     ) + $ExtraCMakeArgs
 
     Write-Log "CMake configure: build_$($BuildType.ToLower())"
@@ -492,3 +492,4 @@ switch ($Action.ToLower()) {
         exit 1
     }
 }
+

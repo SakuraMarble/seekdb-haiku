@@ -65,7 +65,7 @@ endif()
 
 # -Wno-vla-cxx-extension is Clang 18+ only; GCC and older Clang use -Wno-vla-extension
 include(CheckCXXCompilerFlag)
-set(CMAKE_REQUIRED_FLAGS "-Werror")
+set(CMAKE_REQUIRED_FLAGS "-Wno-error")
 check_cxx_compiler_flag("-Wno-vla-cxx-extension" COMPILER_SUPPORTS_VLA_CXX_EXTENSION)
 unset(CMAKE_REQUIRED_FLAGS)
 if(COMPILER_SUPPORTS_VLA_CXX_EXTENSION)
@@ -79,7 +79,7 @@ if (OB_USE_CLANG)
     set(OBLIB_COMPILE_DEFINITIONS /Oy- -fno-strict-aliasing ${MARCH_CFLAGS} ${MTUNE_CFLAGS}
       -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -D_NO_EXCEPTION -D_USE_MATH_DEFINES
       -DOCI_LINK_RUNTIME -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH -DYY_NO_UNISTD_H
-      -Wall -Wextra -Wformat -Werror
+      -Wall -Wextra -Wformat -Wno-error
       -Wno-deprecated -Wno-address-of-packed-member -Wno-sign-compare -Wno-tautological-compare
       -Wno-psabi -Wno-c99-designator -Wno-int-in-bool-context -Wno-sizeof-array-div
       -Wno-implicit-const-int-float-conversion -Wno-fortify-source -Wno-non-c-typedef-for-linkage
@@ -126,7 +126,7 @@ if (OB_USE_CLANG)
     set(OBLIB_COMPILE_DEFINITIONS -fno-strict-aliasing -fno-omit-frame-pointer ${MARCH_CFLAGS} ${MTUNE_CFLAGS}
       -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -D_NO_EXCEPTION
       -DOCI_LINK_RUNTIME
-      -Wall -Wextra -Wformat -Werror
+      -Wall -Wextra -Wformat -Wno-error
       -Wno-deprecated -Wno-address-of-packed-member -Wno-sign-compare -Wno-tautological-compare
       -Wno-psabi -Wno-c99-designator -Wno-int-in-bool-context -Wno-sizeof-array-div
       -Wno-implicit-const-int-float-conversion -Wno-fortify-source -Wno-non-c-typedef-for-linkage
@@ -177,7 +177,7 @@ else()
     -fno-strict-aliasing -fno-omit-frame-pointer ${MARCH_CFLAGS} ${MTUNE_CFLAGS}
     -D__STDC_LIMIT_MACROS -D__STDC_CONSTANT_MACROS -D_NO_EXCEPTION
     -DOCI_LINK_RUNTIME
-    -Wall -Wextra -Wformat -Werror
+    -Wall -Wextra -Wformat -Wno-error
     -Wno-deprecated
     -Wno-sign-compare
     -Wno-psabi

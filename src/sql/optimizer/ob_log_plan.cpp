@@ -15358,7 +15358,7 @@ int ObLogPlan::try_push_topn_into_domain_scan(ObLogicalOperator *&top,
                                                     need_further_sort))) {
       LOG_WARN("failed to push topn into vector index scan", K(ret));
     }
-  } else if (table_scan->is_text_retrieval_scan()) {
+  } else if (table_scan->is_text_retrieval_scan() || table_scan->has_es_match()) {
     if (OB_FAIL(try_push_topn_into_text_retrieval_scan(top,
                                                       topn_expr,
                                                       get_stmt()->get_limit_expr(),
@@ -15444,37 +15444,110 @@ int ObLogPlan::try_push_topn_into_text_retrieval_scan(ObLogicalOperator *&top,
   need_further_sort = true;
   ObLogTableScan *table_scan = NULL;
   bool has_multi_sort_keys = false;
+  bool has_non_match_filter = false;
+  bool can_pushdown = false;
   ObRawExpr *pushed_limit_expr = NULL;
   ObRawExpr *pushed_offset_expr = NULL;
+  ObTextRetrievalInfo *target_tr_info = nullptr;
   if (OB_ISNULL(top) || OB_ISNULL(get_stmt())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(top), K(limit_expr), K(get_stmt()), K(ret));
   } else if (log_op_def::LOG_TABLE_SCAN != top->get_type()) {
     // do nothing
   } else if (OB_FALSE_IT(table_scan = static_cast<ObLogTableScan*>(top))) {
-  } else if (!table_scan->is_text_retrieval_scan() || table_scan->use_index_merge()) {
+  } else if (!(table_scan->is_text_retrieval_scan() || table_scan->has_es_match()) || table_scan->use_index_merge()) {
     // do nothing
-  } else if (table_scan->get_filter_exprs().count() != 0 ||
-             table_scan->get_pushdown_filter_exprs().count() != 0) {
-    // do nothing, topn pushdown requires that only match filter exists on the base table.
-  } else if (sort_keys.count() >= 1 && OB_NOT_NULL(sort_keys.at(0).expr_) &&
-             sort_keys.at(0).expr_ == table_scan->get_text_retrieval_info().match_expr_) {
+  } else {
+    if (table_scan->is_text_retrieval_scan()) {
+      target_tr_info = &table_scan->get_text_retrieval_info();
+    } else if (table_scan->get_match_tr_infos().count() == 1) {
+      // es match topn pushdown only supports single match expr
+      target_tr_info = &table_scan->get_match_tr_infos().at(0);
+    }
+    if (OB_ISNULL(target_tr_info) || OB_ISNULL(target_tr_info->match_expr_)) {
+      // do nothing, no match expr on text retrieval scan
+    } else {
+      const ObRawExpr *match_expr = target_tr_info->match_expr_;
+      for (int64_t i = 0; !has_non_match_filter && i < table_scan->get_filter_exprs().count(); ++i) {
+        const ObRawExpr *filter = table_scan->get_filter_exprs().at(i);
+        if (OB_ISNULL(filter) || !filter->same_as(*match_expr)) {
+          // es match: MATCH() predicate is the match filter itself, treat as match filter.
+          if (!table_scan->has_es_match() || !filter->has_flag(CNT_MATCH_EXPR)) {
+            has_non_match_filter = true;
+          }
+        }
+      }
+      for (int64_t i = 0; !has_non_match_filter && i < table_scan->get_pushdown_filter_exprs().count(); ++i) {
+        const ObRawExpr *filter = table_scan->get_pushdown_filter_exprs().at(i);
+        if (OB_ISNULL(filter) || !filter->same_as(*match_expr)) {
+          if (!table_scan->has_es_match() || !filter->has_flag(CNT_MATCH_EXPR)) {
+            has_non_match_filter = true;
+          }
+        }
+      }
+      if (!has_non_match_filter) {
+        // topn pushdown requires that only match filter exists on the base table.
+        can_pushdown = true;
+      }
+    }
+  }
+  // The top-k pushdown below is only valid when the OFFSET (if any) is applied
+  // by the LIMIT operator kept above this scan. When the statement carries a
+  // non-zero OFFSET, keep the sort operator instead of pushing the top-k into
+  // the scan, otherwise the rows skipped by the scan side and the rows skipped
+  // by the LIMIT side would not compose into the correct result window.
+  bool can_push_topn = can_pushdown;
+  if (OB_SUCC(ret) && can_push_topn && OB_NOT_NULL(offset_expr)) {
+    int64_t offset_value = 0;
+    bool is_null_value = false;
+    if (OB_FAIL(ObTransformUtils::get_expr_int_value(offset_expr,
+                                                     get_optimizer_context().get_params(),
+                                                     get_optimizer_context().get_exec_ctx(),
+                                                     &get_allocator(),
+                                                     offset_value,
+                                                     is_null_value))) {
+      // The offset value is not resolvable at plan time (e.g. an unbound
+      // parameter), conservatively disable the pushdown for correctness.
+      can_push_topn = false;
+      LOG_TRACE("text retrieval topk pushdown skipped, offset not resolvable", K(ret));
+      ret = OB_SUCCESS;
+    } else if (0 == offset_value) {
+      // a zero offset behaves like no offset, keep the pushdown
+    } else {
+      can_push_topn = false;
+      LOG_TRACE("text retrieval topk pushdown skipped due to offset", K(offset_value));
+    }
+  }
+  if (OB_SUCC(ret) && can_push_topn && sort_keys.count() >= 1 && OB_NOT_NULL(sort_keys.at(0).expr_)
+      && OB_NOT_NULL(target_tr_info) && OB_NOT_NULL(target_tr_info->match_expr_)) {
+    if (OB_NOT_NULL(sort_keys.at(0).expr_) && OB_NOT_NULL(target_tr_info->match_expr_) &&
+        sort_keys.at(0).expr_->same_as(*target_tr_info->match_expr_)) {
     // only accept match expr as prefix sort key.
     has_multi_sort_keys = sort_keys.count() == 1 ? false : true;
     need_further_sort = has_multi_sort_keys || table_scan->use_das() || need_exchange;
-    pushed_limit_expr = need_further_sort ? topn_expr : limit_expr;
-    pushed_offset_expr = need_further_sort ? NULL : offset_expr;
+    // OFFSET is applied by the LIMIT operator allocated above this scan:
+    // get_order_by_topn_expr() sets need_limit = true whenever the statement has
+    // an OFFSET, so a LIMIT operator holding the original offset is always kept
+    // on top of the scan. If OFFSET were pushed down here as well, the DAS sort
+    // ctdef (ob_das_sort_iter.cpp) would skip the leading OFFSET rows a second
+    // time and the query would return only (limit - offset) rows. Therefore
+    // always push the total row count (topn_expr == limit + offset) and keep
+    // OFFSET out of the pushdown.
+    (void)offset_expr;
+    pushed_limit_expr = topn_expr;
+    pushed_offset_expr = NULL;
     ObSEArray<OrderItem, 1> tmp_sort_keys;
-    table_scan->get_text_retrieval_info().topk_limit_expr_ = pushed_limit_expr;
-    table_scan->get_text_retrieval_info().topk_offset_expr_ = pushed_offset_expr;
-    table_scan->get_text_retrieval_info().sort_key_.expr_ = sort_keys.at(0).expr_;
-    table_scan->get_text_retrieval_info().sort_key_.order_type_ = sort_keys.at(0).order_type_;
-    table_scan->get_text_retrieval_info().with_ties_ = (has_multi_sort_keys || is_fetch_with_ties);
+    target_tr_info->topk_limit_expr_ = pushed_limit_expr;
+    target_tr_info->topk_offset_expr_ = pushed_offset_expr;
+    target_tr_info->sort_key_.expr_ = sort_keys.at(0).expr_;
+    target_tr_info->sort_key_.order_type_ = sort_keys.at(0).order_type_;
+    target_tr_info->with_ties_ = (has_multi_sort_keys || is_fetch_with_ties);
     if (OB_FAIL(tmp_sort_keys.push_back(sort_keys.at(0)))) {
       LOG_WARN("failed to push back order item", K(ret));
     } else if (OB_FAIL(table_scan->set_op_ordering(tmp_sort_keys))) {
       LOG_WARN("failed to set op ordering", K(ret));
     }
+    } // end if (sort_keys.at(0).expr_ == match_expr_)
   }
   return ret;
 }
