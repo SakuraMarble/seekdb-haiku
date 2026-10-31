@@ -19,6 +19,9 @@ parser.add_argument("mode", choices=("prepare", "measure"))
 parser.add_argument("--root", type=Path, default=Path("/workspace/codex-v5-bridge"))
 parser.add_argument("--label", default="baseline")
 parser.add_argument("--port", type=int, default=2883)
+parser.add_argument("--dataset", choices=("sift250k", "synthetic250k-d256"))
+parser.add_argument("--table-suffix", default="")
+parser.add_argument("--query-root", type=Path)
 args = parser.parse_args()
 connection = pymysql.connect(host="127.0.0.1", port=args.port, user="root", autocommit=True,
                              read_timeout=1200, write_timeout=1200)
@@ -28,8 +31,14 @@ with connection.cursor() as cursor:
     cursor.execute("USE amd_sql_validation")
     for dataset, dimension, table in (("sift250k", 128, "sift"),
                                        ("synthetic250k-d256", 256, "unit_vectors")):
+        if args.dataset and dataset != args.dataset:
+            continue
+        table += args.table_suffix
+        if not table.replace("_", "").isalnum():
+            raise ValueError("invalid benchmark table suffix")
         base = np.fromfile(args.root / dataset / "base.f32", dtype=np.float32).reshape(-1, dimension)
-        queries = np.fromfile(args.root / dataset / "query.f32", dtype=np.float32).reshape(-1, dimension)
+        query_root = args.query_root or args.root
+        queries = np.fromfile(query_root / dataset / "query.f32", dtype=np.float32).reshape(-1, dimension)
         if args.mode == "prepare":
             cursor.execute(f"CREATE TABLE IF NOT EXISTS {table}(id BIGINT PRIMARY KEY,v VECTOR({dimension}))")
             cursor.execute(f"SELECT COUNT(*) FROM {table}")
