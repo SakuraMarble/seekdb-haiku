@@ -79,8 +79,8 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = IVF_PQ;
-  h->ip->graph_degree = 64;
-  h->ip->intermediate_graph_degree = 128;
+  h->ip->graph_degree = 32;
+  h->ip->intermediate_graph_degree = 64;
   h->ip->nn_descent_niter = 100;
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
@@ -164,7 +164,7 @@ static int search_on_worker(void* handle, const float* query, long nq, long topk
     sp = h->search_params;
     {
       size_t required_itopk = (size_t)topk * 4;
-      if (required_itopk < 4096) required_itopk = 4096;
+      if (required_itopk < 16384) required_itopk = 16384;
       sp->itopk_size = required_itopk;
       sp->search_width = 4;
       sp->algo = AUTO;
