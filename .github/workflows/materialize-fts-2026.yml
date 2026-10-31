@@ -1,0 +1,1397 @@
+name: Publish reviewed FTS answer
+on:
+  push:
+    branches: [codex/bootstrap-fts-2026]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Fetch the immutable public AI answer
+        run: |
+          git init answer
+          cd answer
+          git remote add contest-base https://github.com/SakuraMarble/seekdb-haiku.git
+          git config remote.contest-base.promisor true
+          git config remote.contest-base.partialclonefilter blob:none
+          git -c protocol.version=2 fetch --filter=blob:none --no-tags contest-base 7241598c3c2dad01ad027deae7860200d293bdf0
+          git checkout -b codex/fts-2026 FETCH_HEAD
+      - name: Apply the reviewed source patch
+        working-directory: answer
+        run: |
+          cat > ../reviewed.patch <<'FTS_2026_REVIEWED_PATCH'
+          diff --git a/docs/competition-fts.md b/docs/competition-fts.md
+          new file mode 100644
+          index 0000000..fb48052
+          --- /dev/null
+          +++ b/docs/competition-fts.md
+          @@ -0,0 +1,47 @@
+          +# Full-text retrieval optimization
+          +
+          +Based on contest commit `5bce9e06d1281347ad61344e4b01fab9158c58a2` and the existing AI-function answer.
+          +
+          +## Changes
+          +
+          +- Document-local word-frequency maps and IK arbitration maps do not lock their buckets. The initialized global stopword set is immutable. Equal-collation tokens retain the baseline last-spelling representative and full frequency.
+          +- IK processors reuse the already decoded current character. Built-in main and quantifier dictionaries are published lazily as immutable readers. Each reader owns copied packed DAT bytes; KV-cache handles are released before publication, so cache eviction and global shutdown cannot invalidate the reader. Document cursors and segmentation modes remain private.
+          +- A natural-language MATCH used only as a Boolean predicate can consume postings without calculating BM25. All non-WHERE expressions and additional conditions are checked for score consumers. Numeric thresholds, ranked/projection consumers, Boolean search mode, boosts and vector-filter plans retain their scoring path. The existing positive IDF floor makes real natural-language postings nonzero.
+          +- Unscored execution supports DaaT and large-query TaaT, normal and domain-mapping table lookup, and scalar projection. The storage skip vector is allocated independently of scoring; no statistics iterator is accessed when unused.
+          +- Index coverage excludes MATCH columns used solely to identify the index. Actual original-text projection, filtering, aggregation and ordering still require their data columns. Dynamic query text and boosts remain real dependencies. This coverage pass is limited to a single natural-language MATCH in SELECT statements without subqueries or windows.
+          +
+          +No query results, documents, token outputs or benchmark answers are cached. Data generation, SQL, timing and scoring assets are unchanged.
+          +
+          +## Native regressions
+          +
+          +With an isolated native server and `pymysql` installed:
+          +
+          +```sh
+          +python unittest/sql/engine/expr/test_tokenize_hot_path.py
+          +EXPECT_BOOLEAN_ELISION=1 EXPECT_FTS_COVERING=1 \
+          +  python unittest/sql/engine/expr/test_fts_boolean_retrieval.py
+          +```
+          +
+          +The first test covers concurrent first use of smart/max_word IK, independent document state, collation-equal word frequencies and stopwords. The second covers empty/NULL/no-hit queries, 300 distinct query terms, Boolean mode, live insert/update/delete and rollback, scores/projections/ranking/thresholds, original-text consumers and a JOIN. Both run on a real SQL engine. The Boolean test creates and removes only its uniquely named temporary database.
+          +
+          +An independent development harness compared 445 complete TOKENIZE outputs and four complete ordered MATCH-ID sets against the original AI-answer binary. All were identical; 445 additional parses on eight independent concurrent connections also matched. Native shutdown through SIGUSR1 completed with exit code 0. SIGTERM deliberately maps to SIGKILL in this engine and does not exercise teardown.
+          +
+          +## Development measurements
+          +
+          +The original official generator and SQL were executed via PyMySQL with the official iteration/sample counts. These are paired development measurements on one host, with visible run-to-run load variation, and do not establish the contest score. In particular the latest tokenizer timings regressed slightly; the result is reported unchanged.
+          +
+          +| Metric | Original AI binary | This version |
+          +|---|---:|---:|
+          +| build_ik_all_sec | 3.8444 | 3.7470 |
+          +| build_ik_content_sec | 2.9179 | 2.7191 |
+          +| build_beng_en_sec | 1.6139 | 1.5143 |
+          +| tokenize_ik_avg_ms | 0.0796 | 0.0833 |
+          +| tokenize_beng_avg_ms | 0.0419 | 0.0442 |
+          +| query_cn_avg_ms | 1.3400 | 0.9516 |
+          +| query_beng_avg_ms | 1.8700 | 1.5393 |
+          +| query_mixed_avg_ms | 1.5690 | 1.2085 |
+          +| query_limit_avg_ms | 1.7655 | 1.7025 |
+          +
+          +The official reproducible workload remains `tools/benchmark/fts_large_bench.sh` and its unchanged score script, with ROWS=20000, BATCH=500, ROUNDS=3000, QUERY_ROUNDS=200, SAMPLES=3, WARMUP=30 and SKIP_LOAD=0. All four expected hit counts remain 8001/11000/7332/20.
+          +
+          +CPU sampling found repeated UTF-8/collation work during index sorting and per-row merge/projection overhead in queries. Parser and coverage changes address only part of those costs; further improvements remain possible.
+          diff --git a/src/data_plane/api/data_plane/fts/ob_fts_struct.h b/src/data_plane/api/data_plane/fts/ob_fts_struct.h
+          index b2eb961..393e389 100644
+          --- a/src/data_plane/api/data_plane/fts/ob_fts_struct.h
+          +++ b/src/data_plane/api/data_plane/fts/ob_fts_struct.h
+          @@ -51,7 +51,9 @@ private:
+             ObObjMeta meta_;
+           };
+           
+          -typedef common::hash::ObHashMap<ObFTWord, int64_t> ObFTWordMap;
+          +// A word map belongs to one document/parse call. Parallel index builders use
+          +// separate maps; synchronizing each token bucket adds no ownership protection.
+          +typedef common::hash::ObHashMap<ObFTWord, int64_t, common::hash::NoPthreadDefendMode> ObFTWordMap;
+           
+           class ObAddWordFlag final
+           {
+          diff --git a/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp b/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp
+          index 56516ce..d4a53eb 100644
+          --- a/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp
+          +++ b/src/observer/composition/retrieval/ob_das_legacy_tr_merge_iter.cpp
+          @@ -105,7 +105,7 @@ int ObDASLegacyTRMergeIter::init_das_iter_scan_params()
+           {
+             int ret = OB_SUCCESS;
+             const int64_t dim_iter_cnt = taat_mode_ ? 1 : query_tokens_.count();
+          -  if (!ir_ctdef_->need_estimate_total_doc_cnt() && 0 != dim_iter_cnt) {
+          +  if (ir_ctdef_->need_calc_relevance() && !ir_ctdef_->need_estimate_total_doc_cnt() && 0 != dim_iter_cnt) {
+               void *buf = nullptr;
+               if (OB_ISNULL(buf = myself_allocator_.alloc(sizeof(ObTableScanParam)))) {
+                 ret = OB_ALLOCATE_MEMORY_FAILED;
+          @@ -473,24 +473,26 @@ int ObDASLegacyTRMergeIter::init_daat_iter_param(ObTextDaaTParam &iter_param)
+             iter_param.allocator_ = &myself_allocator_;
+             iter_param.mode_flag_ = ir_ctdef_->mode_flag_;
+             iter_param.function_lookup_mode_ = function_lookup_mode_;
+          -  iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_
+          -      = ir_ctdef_->get_doc_agg_ctdef()->pd_expr_spec_.pd_storage_aggregate_output_.at(0);
+          -  iter_param.bm25_param_est_ctx_.estimated_total_doc_cnt_ = ir_ctdef_->estimated_total_doc_cnt_;
+          -  iter_param.bm25_param_est_ctx_.need_est_avg_doc_token_cnt_ = ir_ctdef_->need_avg_doc_len_est();
+          -  iter_param.bm25_param_est_ctx_.can_est_by_sum_skip_index_ = ir_ctdef_->avg_doc_len_est_spec_.can_est_by_sum_skip_index_;
+          -  iter_param.bm25_param_est_ctx_.avg_doc_token_cnt_expr_ = ir_ctdef_->avg_doc_token_cnt_expr_;
+          -  iter_param.bm25_param_est_ctx_.doc_length_est_param_ = &doc_length_est_param_;
+          -  if (query_tokens_.count() == 0) {
+          -    // do nothing
+          -  } else if (OB_ISNULL(iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_)) {
+          -    ret = OB_ERR_UNEXPECTED;
+          -  } else if (OB_FAIL(init_doc_length_est_param())) {
+          -  } else if (!ir_ctdef_->need_estimate_total_doc_cnt()) {
+          -    if (OB_UNLIKELY(!static_cast<sql::ObStoragePushdownFlag>(total_doc_cnt_scan_param_->pd_storage_flag_).is_aggregate_pushdown())) {
+          -      ret = OB_NOT_IMPLEMENT;
+          -      LOG_ERROR("aggregate without pushdown not implemented", K(ret));
+          -    } else {
+          -      iter_param.bm25_param_est_ctx_.total_doc_cnt_iter_ = static_cast<sql::ObDASScanIter*>(children_[children_cnt_ - 1]);
+          +  if (ir_ctdef_->need_calc_relevance()) {
+          +    iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_
+          +        = ir_ctdef_->get_doc_agg_ctdef()->pd_expr_spec_.pd_storage_aggregate_output_.at(0);
+          +    iter_param.bm25_param_est_ctx_.estimated_total_doc_cnt_ = ir_ctdef_->estimated_total_doc_cnt_;
+          +    iter_param.bm25_param_est_ctx_.need_est_avg_doc_token_cnt_ = ir_ctdef_->need_avg_doc_len_est();
+          +    iter_param.bm25_param_est_ctx_.can_est_by_sum_skip_index_ = ir_ctdef_->avg_doc_len_est_spec_.can_est_by_sum_skip_index_;
+          +    iter_param.bm25_param_est_ctx_.avg_doc_token_cnt_expr_ = ir_ctdef_->avg_doc_token_cnt_expr_;
+          +    iter_param.bm25_param_est_ctx_.doc_length_est_param_ = &doc_length_est_param_;
+          +    if (query_tokens_.count() == 0) {
+          +      // do nothing
+          +    } else if (OB_ISNULL(iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_)) {
+          +      ret = OB_ERR_UNEXPECTED;
+          +    } else if (OB_FAIL(init_doc_length_est_param())) {
+          +    } else if (!ir_ctdef_->need_estimate_total_doc_cnt()) {
+          +      if (OB_UNLIKELY(!static_cast<sql::ObStoragePushdownFlag>(total_doc_cnt_scan_param_->pd_storage_flag_).is_aggregate_pushdown())) {
+          +        ret = OB_NOT_IMPLEMENT;
+          +        LOG_ERROR("aggregate without pushdown not implemented", K(ret));
+          +      } else {
+          +        iter_param.bm25_param_est_ctx_.total_doc_cnt_iter_ = static_cast<sql::ObDASScanIter*>(children_[children_cnt_ - 1]);
+          +      }
+               }
+             }
+             if (OB_SUCC(ret)) {
+          @@ -524,24 +526,27 @@ int ObDASLegacyTRMergeIter::init_taat_iter_param(ObTextTaaTParam &iter_param)
+             iter_param.allocator_ = &myself_allocator_;
+             iter_param.mode_flag_ = ir_ctdef_->mode_flag_;
+             iter_param.function_lookup_mode_ = function_lookup_mode_;
+          -  iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_
+          -      = ir_ctdef_->get_doc_agg_ctdef()->pd_expr_spec_.pd_storage_aggregate_output_.at(0);
+          -  iter_param.bm25_param_est_ctx_.estimated_total_doc_cnt_ = ir_ctdef_->estimated_total_doc_cnt_;
+          -  iter_param.bm25_param_est_ctx_.need_est_avg_doc_token_cnt_ = ir_ctdef_->need_avg_doc_len_est();
+          -  iter_param.bm25_param_est_ctx_.can_est_by_sum_skip_index_ = ir_ctdef_->avg_doc_len_est_spec_.can_est_by_sum_skip_index_;
+          -  iter_param.bm25_param_est_ctx_.avg_doc_token_cnt_expr_ = ir_ctdef_->avg_doc_token_cnt_expr_;
+          -  iter_param.bm25_param_est_ctx_.doc_length_est_param_ = &doc_length_est_param_;
+          -  if (OB_ISNULL(iter_param.dim_iter_ = dim_iter_)) {
+          -    ret = OB_ERR_UNEXPECTED;
+          -  } else if (OB_ISNULL(iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_)) {
+          -    ret = OB_ERR_UNEXPECTED;
+          -  } else if (OB_FAIL(init_doc_length_est_param())) {
+          -  } else if (!ir_ctdef_->need_estimate_total_doc_cnt()) {
+          -    if (OB_UNLIKELY(!static_cast<sql::ObStoragePushdownFlag>(total_doc_cnt_scan_param_->pd_storage_flag_).is_aggregate_pushdown())) {
+          -      ret = OB_NOT_IMPLEMENT;
+          -      LOG_ERROR("aggregate without pushdown not implemented", K(ret));
+          -    } else {
+          -      iter_param.bm25_param_est_ctx_.total_doc_cnt_iter_ = static_cast<sql::ObDASScanIter*>(children_[children_cnt_ - 1]);
+          +  iter_param.dim_iter_ = dim_iter_;
+          +  if (ir_ctdef_->need_calc_relevance()) {
+          +    iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_
+          +        = ir_ctdef_->get_doc_agg_ctdef()->pd_expr_spec_.pd_storage_aggregate_output_.at(0);
+          +    iter_param.bm25_param_est_ctx_.estimated_total_doc_cnt_ = ir_ctdef_->estimated_total_doc_cnt_;
+          +    iter_param.bm25_param_est_ctx_.need_est_avg_doc_token_cnt_ = ir_ctdef_->need_avg_doc_len_est();
+          +    iter_param.bm25_param_est_ctx_.can_est_by_sum_skip_index_ = ir_ctdef_->avg_doc_len_est_spec_.can_est_by_sum_skip_index_;
+          +    iter_param.bm25_param_est_ctx_.avg_doc_token_cnt_expr_ = ir_ctdef_->avg_doc_token_cnt_expr_;
+          +    iter_param.bm25_param_est_ctx_.doc_length_est_param_ = &doc_length_est_param_;
+          +    if (OB_ISNULL(iter_param.dim_iter_ = dim_iter_)) {
+          +      ret = OB_ERR_UNEXPECTED;
+          +    } else if (OB_ISNULL(iter_param.bm25_param_est_ctx_.total_doc_cnt_expr_)) {
+          +      ret = OB_ERR_UNEXPECTED;
+          +    } else if (OB_FAIL(init_doc_length_est_param())) {
+          +    } else if (!ir_ctdef_->need_estimate_total_doc_cnt()) {
+          +      if (OB_UNLIKELY(!static_cast<sql::ObStoragePushdownFlag>(total_doc_cnt_scan_param_->pd_storage_flag_).is_aggregate_pushdown())) {
+          +        ret = OB_NOT_IMPLEMENT;
+          +        LOG_ERROR("aggregate without pushdown not implemented", K(ret));
+          +      } else {
+          +        iter_param.bm25_param_est_ctx_.total_doc_cnt_iter_ = static_cast<sql::ObDASScanIter*>(children_[children_cnt_ - 1]);
+          +      }
+               }
+             }
+             return ret;
+          @@ -1111,7 +1116,7 @@ int ObDASLegacyTRMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_ctdef,
+               int64_t doc_length = 0;
+               storage::ObFTParseHelper tokenize_helper;
+               common::ObSEArray<ObFTWord, 16> tokens;
+          -    hash::ObHashMap<ObFTWord, int64_t> token_map;
+          +    storage::ObFTWordMap token_map;
+               const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
+               if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
+               } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+          @@ -1122,7 +1127,7 @@ int ObDASLegacyTRMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_ctdef,
+                                      doc_length,
+                                      token_map))) {
+               } else {
+          -      for (hash::ObHashMap<ObFTWord, int64_t>::const_iterator iter = token_map.begin();
+          +      for (storage::ObFTWordMap::const_iterator iter = token_map.begin();
+                     OB_SUCC(ret) && iter != token_map.end();
+                     ++iter) {
+                   const ObFTWord &token = iter->first;
+          diff --git a/src/sql/das/iter/ob_das_iter_utils.cpp b/src/sql/das/iter/ob_das_iter_utils.cpp
+          index c12f71a..51ecf66 100644
+          --- a/src/sql/das/iter/ob_das_iter_utils.cpp
+          +++ b/src/sql/das/iter/ob_das_iter_utils.cpp
+          @@ -1118,7 +1118,18 @@ int ObDASIterUtils::create_text_retrieval_tree(ObTableScanParam &scan_param,
+                   main_lookup_keep_order = true;
+                   // TODO: may be optimized to use forward
+                 }
+          -      if (table_lookup_ctdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP) {
+          +      if (table_lookup_ctdef->op_type_ == ObDASOpType::DAS_OP_TABLE_LOOKUP) {
+          +        ObDASIter *lookup_result = nullptr;
+          +        if (OB_FAIL(create_local_lookup_sub_tree(
+          +            scan_param, alloc, table_lookup_ctdef->get_rowkey_scan_ctdef(),
+          +            table_lookup_rtdef->get_rowkey_scan_rtdef(), table_lookup_ctdef->get_lookup_scan_ctdef(),
+          +            table_lookup_rtdef->get_lookup_scan_rtdef(), table_lookup_ctdef, table_lookup_rtdef,
+          +            related_tablet_ids, trans_desc, snapshot, related_tablet_ids.lookup_tablet_id_,
+          +            root_iter, lookup_result))) {
+          +        } else {
+          +          root_iter = lookup_result;
+          +        }
+          +      } else if (table_lookup_ctdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP) {
+                   ret = OB_ERR_UNEXPECTED;
+                 } else if (OB_FAIL(create_cache_lookup_sub_tree(
+                     scan_param,
+          @@ -1496,8 +1507,7 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
+               if (ir_scan_ctdef->has_pushdown_topk() && !has_duplicate_boolean_tokens) {
+                 merge_iter_param.topk_mode_ = 1;
+                 merge_iter_param.daat_mode_ = 1;
+          -    } else if (merge_iter_param.query_tokens_.count() > OB_MAX_TEXT_RETRIEVAL_TOKEN_CNT
+          -        || (!is_func_lookup && !ir_scan_ctdef->need_proj_relevance_score())) {
+          +    } else if (merge_iter_param.query_tokens_.count() > OB_MAX_TEXT_RETRIEVAL_TOKEN_CNT) {
+                 if (BOOLEAN_MODE == ir_scan_ctdef->mode_flag_) {
+                   ret = OB_NOT_SUPPORTED;
+                   LOG_USER_ERROR(OB_NOT_SUPPORTED, "Boolean mode with more than 256 tokens is");
+          @@ -1537,7 +1547,8 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
+             }
+           
+             if (OB_FAIL(ret)) {
+          -  } else if (size > 0 && !ir_scan_ctdef->need_estimate_total_doc_cnt()) {
+          +  } else if (size > 0 && ir_scan_ctdef->need_calc_relevance()
+          +             && !ir_scan_ctdef->need_estimate_total_doc_cnt()) {
+               ObDASScanIterParam doc_cnt_agg_param;
+               ObDASScanIter *doc_cnt_agg_iter = nullptr;
+               init_scan_iter_param(doc_cnt_agg_param, ir_scan_ctdef->get_doc_agg_ctdef(), ir_scan_rtdef);
+          @@ -1784,8 +1795,9 @@ int ObDASIterUtils::create_domain_lookup_sub_tree(ObTableScanParam &scan_param,
+           
+             if (OB_ISNULL(table_lookup_ctdef) || OB_ISNULL(table_lookup_rtdef)) {
+               ret = OB_INVALID_ARGUMENT;
+          -  } else if (OB_UNLIKELY(table_lookup_ctdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP ||
+          -                         table_lookup_rtdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP)) {
+          +  } else if (OB_UNLIKELY(table_lookup_ctdef->op_type_ != table_lookup_rtdef->op_type_
+          +      || (table_lookup_ctdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP
+          +          && table_lookup_ctdef->op_type_ != ObDASOpType::DAS_OP_TABLE_LOOKUP))) {
+               ret = OB_ERR_UNEXPECTED;
+             } else if (OB_UNLIKELY(table_lookup_ctdef->get_rowkey_scan_ctdef()->op_type_ != ObDASOpType::DAS_OP_IR_AUX_LOOKUP)) {
+               ret = OB_ERR_UNEXPECTED;
+          diff --git a/src/sql/das/iter/ob_das_text_retrieval_merge_iter.cpp b/src/sql/das/iter/ob_das_text_retrieval_merge_iter.cpp
+          index 34682eb..da7128a 100644
+          --- a/src/sql/das/iter/ob_das_text_retrieval_merge_iter.cpp
+          +++ b/src/sql/das/iter/ob_das_text_retrieval_merge_iter.cpp
+          @@ -238,7 +238,7 @@ int ObDASTextRetrievalMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_c
+               int64_t doc_length = 0;
+               storage::ObFTParseHelper tokenize_helper;
+               common::ObSEArray<ObFTWord, 16> tokens;
+          -    hash::ObHashMap<ObFTWord, int64_t> token_map;
+          +    storage::ObFTWordMap token_map;
+               const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
+               if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
+               } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+          @@ -249,7 +249,7 @@ int ObDASTextRetrievalMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_c
+                                      doc_length,
+                                      token_map))) {
+               } else {
+          -      for (hash::ObHashMap<ObFTWord, int64_t>::const_iterator iter = token_map.begin();
+          +      for (storage::ObFTWordMap::const_iterator iter = token_map.begin();
+                     OB_SUCC(ret) && iter != token_map.end();
+                     ++iter) {
+                   const ObFTWord &token = iter->first;
+          diff --git a/src/sql/das/ob_das_scan_op.cpp b/src/sql/das/ob_das_scan_op.cpp
+          index 37f0916..22d6008 100644
+          --- a/src/sql/das/ob_das_scan_op.cpp
+          +++ b/src/sql/das/ob_das_scan_op.cpp
+          @@ -1016,6 +1016,9 @@ int ObDASScanOp::get_fts_tablet_ids(common::ObIArray<ObDASFTSTabletID> &fts_tabl
+             } else if (DAS_OP_IR_SCAN == rtdef->op_type_) {
+               ObDASIRScanRtDef *ir_rtdef = static_cast<ObDASIRScanRtDef *>(rtdef);
+               ObDASFTSTabletID fts_tablet_id;
+          +    if (ir_rtdef->get_inv_idx_scan_rtdef() == scan_rtdef_) {
+          +      fts_tablet_id.inv_idx_tablet_id_ = tablet_id_;
+          +    }
+               for (int64_t i = 0; OB_SUCC(ret) && i < related_rtdefs_.count(); ++i) {
+                 if (ir_rtdef->get_inv_idx_agg_rtdef() == related_rtdefs_.at(i) ||
+                     ir_rtdef->get_inv_idx_scan_rtdef() == related_rtdefs_.at(i)) {
+          diff --git a/src/sql/optimizer/ob_join_order.cpp b/src/sql/optimizer/ob_join_order.cpp
+          index 4b87652..dc4700d 100644
+          --- a/src/sql/optimizer/ob_join_order.cpp
+          +++ b/src/sql/optimizer/ob_join_order.cpp
+          @@ -46,6 +46,48 @@ class QueryRangeInfo;
+           
+           ERRSIM_POINT_DEF(EN_FORCE_INDEX_MERGE_PLAN, "Force to use index merge if it is possible");
+           
+          +// MATCH columns identify the inverted index; their original text is not read
+          +// by retrieval. Keep actual consumers, including dynamic query text, separate
+          +// when deciding whether the index covers the statement.
+          +static int collect_fts_data_column_ids(const ObDMLStmt &stmt, uint64_t table_id,
+          +                                     ObIArray<uint64_t> &column_ids)
+          +{
+          +  int ret = OB_SUCCESS;
+          +  ObSEArray<ObRawExpr *, 16> roots;
+          +  ObSEArray<const ObRawExpr *, 32> pending;
+          +  if (OB_FAIL(stmt.get_relation_exprs(roots))) {
+          +  }
+          +  for (int64_t i = 0; OB_SUCC(ret) && i < roots.count(); ++i) {
+          +    ret = pending.push_back(roots.at(i));
+          +  }
+          +  while (OB_SUCC(ret) && !pending.empty()) {
+          +    const ObRawExpr *expr = pending.at(pending.count() - 1);
+          +    pending.pop_back();
+          +    if (OB_ISNULL(expr)) {
+          +      ret = OB_ERR_UNEXPECTED;
+          +    } else if (expr->is_match_against_expr()) {
+          +      const auto *match = static_cast<const ObMatchFunRawExpr *>(expr);
+          +      if (OB_FAIL(pending.push_back(match->get_search_key()))) {
+          +      } else if (nullptr != match->get_param_text_expr()) {
+          +        ret = pending.push_back(match->get_param_text_expr());
+          +      }
+          +      for (int64_t i = 0; OB_SUCC(ret) && i < match->get_columns_boosts().count(); ++i) {
+          +        ret = pending.push_back(match->get_columns_boosts().at(i));
+          +      }
+          +    } else if (expr->is_column_ref_expr()) {
+          +      const auto *column = static_cast<const ObColumnRefRawExpr *>(expr);
+          +      if (column->get_table_id() == table_id) {
+          +        ret = add_var_to_array_no_dup(column_ids, column->get_column_id());
+          +      }
+          +    } else {
+          +      for (int64_t i = 0; OB_SUCC(ret) && i < expr->get_param_count(); ++i) {
+          +        ret = pending.push_back(expr->get_param_expr(i));
+          +      }
+          +    }
+          +  }
+          +  return ret;
+          +}
+          +
+           ObJoinOrder::~ObJoinOrder()
+           {
+           
+          @@ -12598,6 +12640,25 @@ int ObJoinOrder::get_simple_index_info(const uint64_t table_id,
+                                                     column_ids,
+                                                     dummy_columns))) {
+             } else if (index_id != ref_table_id) {
+          +    if (index_schema->is_fts_index_aux() && stmt->is_select_stmt()
+          +        && !stmt->has_subquery()
+          +        && !static_cast<const ObSelectStmt *>(stmt)->has_window_function()
+          +        && stmt->get_match_exprs().count() == 1
+          +        && stmt->get_match_exprs().at(0)->get_mode_flag() == NATURAL_LANGUAGE_MODE
+          +        && !stmt->get_match_exprs().at(0)->is_es_match()) {
+          +      ObSEArray<uint64_t, 16> data_column_ids;
+          +      ObSEArray<uint64_t, 16> filtered_column_ids;
+          +      if (OB_FAIL(collect_fts_data_column_ids(*stmt, table_id, data_column_ids))) {
+          +      }
+          +      for (int64_t i = 0; OB_SUCC(ret) && i < column_ids.count(); ++i) {
+          +        if (ObOptimizerUtil::find_item(data_column_ids, column_ids.at(i))) {
+          +          ret = filtered_column_ids.push_back(column_ids.at(i));
+          +        }
+          +      }
+          +      if (OB_SUCC(ret)) {
+          +        ret = column_ids.assign(filtered_column_ids);
+          +      }
+          +    }
+               is_unique_index = index_schema->is_unique_index();
+               is_index_global = index_schema->is_global_index_table();
+               is_index_back = index_schema->is_spatial_index() ? true : false;
+          @@ -16711,7 +16772,7 @@ int ObJoinOrder::get_query_tokens(ObMatchFunRawExpr *match_expr,
+               const ObObjMeta &key_meta = match_expr->get_search_key()->get_result_meta();
+               storage::ObFTParseHelper tokenize_helper;
+               common::ObSEArray<ObFTWord, 16> tokens;
+          -    hash::ObHashMap<ObFTWord, int64_t> token_map;
+          +    storage::ObFTWordMap token_map;
+               int64_t doc_length = 0;
+               const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
+               if (search_text_string.length() == 0) {
+          @@ -16725,7 +16786,7 @@ int ObJoinOrder::get_query_tokens(ObMatchFunRawExpr *match_expr,
+                                      doc_length,
+                                      token_map))) {
+               } else {
+          -      for (hash::ObHashMap<ObFTWord, int64_t>::const_iterator iter = token_map.begin();
+          +      for (storage::ObFTWordMap::const_iterator iter = token_map.begin();
+                     OB_SUCC(ret) && iter != token_map.end();
+                     ++iter) {
+                   const ObFTWord &token = iter->first;
+          diff --git a/src/sql/optimizer/ob_log_plan.cpp b/src/sql/optimizer/ob_log_plan.cpp
+          index ae1d745..30bc486 100644
+          --- a/src/sql/optimizer/ob_log_plan.cpp
+          +++ b/src/sql/optimizer/ob_log_plan.cpp
+          @@ -47,6 +47,7 @@
+           #include "query/vector/ob_vector_index_util.h"
+           #include "sql/optimizer/ob_log_expand.h"
+           #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
+          +#include "sql/resolver/dml/ob_stmt_expr_visitor.h"
+           #include "sql/optimizer/ob_log_insert.h"
+           #include "sql/ob_sql_trans_control.h"
+           
+          @@ -12047,6 +12048,39 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
+               if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
+               } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.rowkey_idx_tid_ == OB_INVALID_ID))) {
+               }
+          +    if (OB_SUCC(ret) && get_stmt()->is_select_stmt()
+          +        && match_pred->get_expr_type() == T_OP_BOOL
+          +        && match_pred->get_param_count() == 1
+          +        && match_pred->get_param_expr(0) == match_against
+          +        && match_against->get_mode_flag() == NATURAL_LANGUAGE_MODE
+          +        && match_against->get_columns_boosts().empty()
+          +        && nullptr == match_against->get_param_text_expr()
+          +        && !table_scan->is_vec_idx_scan() && !table_scan->is_vec_adaptive_scan()) {
+          +      ObSEArray<ObRawExpr *, 16> other_exprs;
+          +      ObStmtExprGetter visitor;
+          +      visitor.set_relation_scope();
+          +      visitor.remove_scope(SCOPE_WHERE);
+          +      bool score_used = false;
+          +      if (OB_FAIL(get_stmt()->get_relation_exprs(other_exprs, visitor))) {
+          +      } else {
+          +        // Check non-WHERE consumers separately: a projected expression can be
+          +        // shared with the predicate and still require its real numeric score.
+          +        score_used = ObOptimizerUtil::is_sub_expr(match_against, other_exprs);
+          +        const auto &conditions = get_stmt()->get_condition_exprs();
+          +        for (int64_t i = 0; !score_used && i < conditions.count(); ++i) {
+          +          if (conditions.at(i) != match_pred) {
+          +            score_used = ObOptimizerUtil::is_sub_expr(match_against, conditions.at(i));
+          +          }
+          +        }
+          +        if (!score_used) {
+          +          // Natural-language postings already prove this Boolean predicate.
+          +          // BM25 floors IDF to a positive epsilon, so a real posting has a
+          +          // nonzero score. Keep ranked/threshold/Boolean-mode queries intact.
+          +          tr_info.need_calc_relevance_ = false;
+          +          tr_info.pushdown_match_filter_ = nullptr;
+          +        }
+          +      }
+          +    }
+             }
+           
+             for (int64_t i = 0; OB_SUCC(ret) && i < all_match_filters.count(); ++i) {
+          diff --git a/src/storage/fts/dict/ob_ft_dict_hub.cpp b/src/storage/fts/dict/ob_ft_dict_hub.cpp
+          index 9677e92..f040cd7 100644
+          --- a/src/storage/fts/dict/ob_ft_dict_hub.cpp
+          +++ b/src/storage/fts/dict/ob_ft_dict_hub.cpp
+          @@ -28,6 +28,22 @@ namespace oceanbase
+           {
+           namespace storage
+           {
+          +struct ObFTDictHub::SharedIKDictionary
+          +{
+          +  explicit SharedIKDictionary(const ObFTDictDesc &desc)
+          +      : allocator_(lib::ObMemAttr("FTDictShared")),
+          +        ranges_(allocator_), dictionary_(allocator_, &ranges_, desc) {}
+          +
+          +  ObArenaAllocator allocator_;
+          +  ObFTCacheRangeContainer ranges_;
+          +  ObFTRangeDict dictionary_;
+          +};
+          +
+          +ObFTDictHub::~ObFTDictHub()
+          +{
+          +  destroy();
+          +}
+          +
+           int ObFTDictHub::init()
+           {
+             static constexpr int K_MAX_DICT_BUCKET = 128; // for now, only built-in dicts.
+          @@ -43,9 +59,57 @@ int ObFTDictHub::init()
+           int ObFTDictHub::destroy()
+           {
+             int ret = OB_SUCCESS;
+          +  auto *main = main_dictionary_.exchange(nullptr, std::memory_order_acq_rel);
+          +  auto *quantifier = quantifier_dictionary_.exchange(nullptr, std::memory_order_acq_rel);
+          +  OB_DELETE(SharedIKDictionary, "FTDictShared", main);
+          +  OB_DELETE(SharedIKDictionary, "FTDictShared", quantifier);
+             is_inited_ = false;
+             return ret;
+           }
+          +
+          +int ObFTDictHub::get_builtin_ik_dictionary(ObFTDictType type, const ObIFTDict *&dictionary)
+          +{
+          +  int ret = OB_SUCCESS;
+          +  dictionary = nullptr;
+          +  if (!is_inited_) {
+          +    ret = OB_NOT_INIT;
+          +  } else if (type != ObFTDictType::DICT_IK_MAIN && type != ObFTDictType::DICT_IK_QUAN) {
+          +    ret = OB_INVALID_ARGUMENT;
+          +  } else {
+          +    auto &slot = type == ObFTDictType::DICT_IK_MAIN ? main_dictionary_ : quantifier_dictionary_;
+          +    SharedIKDictionary *view = slot.load(std::memory_order_acquire);
+          +    if (nullptr == view) {
+          +      lib::ObMutexGuard guard(shared_dictionary_mutex_);
+          +      view = slot.load(std::memory_order_relaxed);
+          +      if (nullptr == view) {
+          +        const ObFTDictDesc desc(type == ObFTDictType::DICT_IK_MAIN ? "main_dict" : "quan_dict",
+          +                               type, ObCharsetType::CHARSET_UTF8MB4, ObCollationType::CS_TYPE_UTF8MB4_BIN);
+          +        if (OB_ISNULL(view = OB_NEW(SharedIKDictionary, "FTDictShared", desc))) {
+          +          ret = OB_ALLOCATE_MEMORY_FAILED;
+          +        } else {
+          +          if (OB_FAIL(load_cache(desc, view->ranges_)) && OB_ENTRY_NOT_EXIST == ret) {
+          +            ret = build_cache(desc, view->ranges_);
+          +          }
+          +          if (OB_SUCC(ret)) {
+          +            ret = view->dictionary_.init(true);
+          +          }
+          +          if (OB_SUCC(ret)) {
+          +            // No KV-cache handles survive publication. The owned snapshot
+          +            // stays valid through cache eviction and server shutdown ordering.
+          +            view->ranges_.reset();
+          +            slot.store(view, std::memory_order_release);
+          +          } else {
+          +            OB_DELETE(SharedIKDictionary, "FTDictShared", view);
+          +          }
+          +        }
+          +      }
+          +    }
+          +    if (OB_SUCC(ret)) {
+          +      dictionary = &view->dictionary_;
+          +    }
+          +  }
+          +  return ret;
+          +}
+           int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)
+           {
+             int ret = OB_SUCCESS;
+          diff --git a/src/storage/fts/dict/ob_ft_dict_hub.h b/src/storage/fts/dict/ob_ft_dict_hub.h
+          index e60b1f2..09f7bfa 100644
+          --- a/src/storage/fts/dict/ob_ft_dict_hub.h
+          +++ b/src/storage/fts/dict/ob_ft_dict_hub.h
+          @@ -19,8 +19,11 @@
+           
+           #include "lib/charset/ob_charset.h"
+           #include "lib/lock/ob_bucket_lock.h"
+          +#include "lib/lock/ob_mutex.h"
+           #include "storage/fts/dict/ob_ft_dict_def.h"
+           
+          +#include <atomic>
+          +
+           namespace oceanbase
+           {
+           namespace storage
+          @@ -93,11 +96,14 @@ private:
+           };
+           
+           class ObFTCacheRangeContainer;
+          +class ObIFTDict;
+           class ObFTDictHub
+           {
+           public:
+          -  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
+          -  ~ObFTDictHub() {}
+          +  ObFTDictHub()
+          +      : is_inited_(false), dict_map_(), rw_dict_lock_(), shared_dictionary_mutex_(),
+          +        main_dictionary_(nullptr), quantifier_dictionary_(nullptr) {}
+          +  ~ObFTDictHub();
+           
+             int init();
+           
+          @@ -107,6 +113,10 @@ public:
+           
+             int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
+           
+          +  // Built-in dictionaries are immutable. Share owned DAT snapshots, while
+          +  // keeping all matching cursors and arbitration state local to each parser.
+          +  int get_builtin_ik_dictionary(ObFTDictType type, const ObIFTDict *&dictionary);
+          +
+           private:
+             int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
+           
+          @@ -118,6 +128,10 @@ private:
+             // holds info of dict
+             hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
+             ObBucketLock rw_dict_lock_;
+          +  struct SharedIKDictionary;
+          +  lib::ObMutex shared_dictionary_mutex_;
+          +  std::atomic<SharedIKDictionary *> main_dictionary_;
+          +  std::atomic<SharedIKDictionary *> quantifier_dictionary_;
+           };
+           
+           } //  namespace storage
+          diff --git a/src/storage/fts/dict/ob_ft_range_dict.cpp b/src/storage/fts/dict/ob_ft_range_dict.cpp
+          index b61365a..771fac1 100644
+          --- a/src/storage/fts/dict/ob_ft_range_dict.cpp
+          +++ b/src/storage/fts/dict/ob_ft_range_dict.cpp
+          @@ -301,14 +301,22 @@ int ObFTRangeDict::build_one_range(const ObFTDictDesc &desc,
+           }
+           
+           int ObFTRangeDict::init()
+          +{
+          +  return init(false);
+          +}
+          +
+          +int ObFTRangeDict::init(bool copy_cache_data)
+           {
+             int ret = OB_SUCCESS;
+             if (is_inited_) {
+               ret = OB_INIT_TWICE;
+             } else {
+          -    if (OB_FAIL(build_dict_from_cache(*range_container_))) {
+          +    if (copy_cache_data) {
+          +      range_alloc_.set_attr(lib::ObMemAttr("FTDictShared"));
+          +    }
+          +    if (OB_FAIL(build_dict_from_cache(*range_container_, copy_cache_data))) {
+               }
+          -    is_inited_ = true;
+          +    is_inited_ = OB_SUCC(ret);
+             }
+             return ret;
+           }
+          @@ -402,7 +410,7 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict
+             return ret;
+           }
+           
+          -int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
+          +int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container, bool copy_cache_data)
+           {
+             int ret = OB_SUCCESS;
+             for (ObList<ObFTCacheRangeHandle *, ObIAllocator>::const_iterator iter = range_container.get_handles().begin();
+          @@ -411,7 +419,17 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
+               ObFTCacheRangeHandle *ptr = *iter;
+               ObFTCacheDict *dict = nullptr;
+               ObFTDAT *dat = ptr->value_->dat_block_;
+          -    if (OB_ISNULL(dict = OB_NEWx(ObFTCacheDict, &range_alloc_, ObCollationType::CS_TYPE_UTF8MB4_BIN, dat))) {
+          +    if (copy_cache_data) {
+          +      ObFTDAT *owned = static_cast<ObFTDAT *>(range_alloc_.alloc(dat->mem_block_size_));
+          +      if (OB_ISNULL(owned)) {
+          +        ret = OB_ALLOCATE_MEMORY_FAILED;
+          +      } else {
+          +        MEMCPY(owned, dat, dat->mem_block_size_);
+          +        dat = owned;
+          +      }
+          +    }
+          +    if (OB_FAIL(ret)) {
+          +    } else if (OB_ISNULL(dict = OB_NEWx(ObFTCacheDict, &range_alloc_, ObCollationType::CS_TYPE_UTF8MB4_BIN, dat))) {
+                 ret = OB_ALLOCATE_MEMORY_FAILED;
+               } else {
+                 ObFTRange range;
+          diff --git a/src/storage/fts/dict/ob_ft_range_dict.h b/src/storage/fts/dict/ob_ft_range_dict.h
+          index bbbb405..3fac887 100644
+          --- a/src/storage/fts/dict/ob_ft_range_dict.h
+          +++ b/src/storage/fts/dict/ob_ft_range_dict.h
+          @@ -42,7 +42,7 @@ public:
+                   range_dicts_(&range_alloc_), range_container_(range_container)
+             {
+             }
+          -  ~ObFTRangeDict() override{};
+          +  ~ObFTRangeDict() override { destroy(); }
+           
+           public:
+             struct ObFTRange final
+          @@ -54,6 +54,7 @@ public:
+           
+           public:
+             int init() override;
+          +  int init(bool copy_cache_data);
+             int match(const ObString &single_word, ObDATrieHit &hit) const override;
+             int match(const ObString &words, bool &is_match) const override;
+             int match_with_hit(const ObString &single_word,
+          @@ -61,7 +62,7 @@ public:
+                                ObDATrieHit &hit) const override;
+           
+           public:
+          -  int build_dict_from_cache(const ObFTCacheRangeContainer &range_container);
+          +  int build_dict_from_cache(const ObFTCacheRangeContainer &range_container, bool copy_cache_data = false);
+           
+             static int try_load_cache(const ObFTDictDesc &desc,
+                                       const uint32_t range_count,
+          diff --git a/src/storage/fts/ik/ob_ik_arbitrator.h b/src/storage/fts/ik/ob_ik_arbitrator.h
+          index 40837f3..ced6d27 100644
+          --- a/src/storage/fts/ik/ob_ik_arbitrator.h
+          +++ b/src/storage/fts/ik/ob_ik_arbitrator.h
+          @@ -61,7 +61,8 @@ private:
+           
+           private:
+             ObArenaAllocator alloc_;
+          -  hash::ObHashMap<int64_t, ObIKTokenChain *> chains_;
+          +  // Arbitration state is local to one parser batch.
+          +  hash::ObHashMap<int64_t, ObIKTokenChain *, hash::NoPthreadDefendMode> chains_;
+           
+           private:
+             DISALLOW_COPY_AND_ASSIGN(ObIKArbitrator);
+          diff --git a/src/storage/fts/ob_fts_stop_word.cpp b/src/storage/fts/ob_fts_stop_word.cpp
+          index 4cde6a7..ba1cae3 100644
+          --- a/src/storage/fts/ob_fts_stop_word.cpp
+          +++ b/src/storage/fts/ob_fts_stop_word.cpp
+          @@ -74,36 +74,39 @@ void ObStopWordChecker::destroy()
+           int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
+           {
+             int ret = OB_SUCCESS;
+          -  
+          -  
+          -  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+             if (OB_UNLIKELY(!inited_)) {
+               ret = OB_NOT_INIT;
+             } else if (OB_UNLIKELY(word.empty())) {
+               ret = OB_INVALID_ARGUMENT;
+             } else {
+               common::ObString cmp_str;
+          -    // do nothing set out with in if type is the same.
+          -    if (OB_FAIL(common::ObCharset::charset_convert(
+          -                                       allocator,
+          -                                       word.get_word().get_string(),
+          -                                       word.get_collation_type(),
+          -                                       stopword_type_.get_collation_type(),
+          -                                       cmp_str))) {
+          +    // All UTF8MB4 collations share the same bytes. Keep the checker's original
+          +    // collation for lookup while avoiding a temporary arena for every token.
+          +    auto lookup = [this](const common::ObString &text) {
+          +      const ObFTWord converted(text.length(), text.ptr(), stopword_type_);
+          +      return stopword_set_.exist_refactored(converted);
+          +    };
+          +    if (common::ObCharset::charset_type_by_coll(word.get_collation_type())
+          +        == common::ObCharset::charset_type_by_coll(stopword_type_.get_collation_type())) {
+          +      ret = lookup(word.get_word().get_string());
+               } else {
+          -      ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
+          -      ret = stopword_set_.exist_refactored(converted);
+          -      if (OB_HASH_NOT_EXIST == ret) {
+          -        is_stopword = false;
+          -        ret = OB_SUCCESS;
+          -      } else if (OB_HASH_EXIST == ret) {
+          -        is_stopword = true;
+          -        ret = OB_SUCCESS;
+          -      } else if (OB_SUCC(ret)) {
+          -        ret = OB_ERR_UNEXPECTED;
+          +      common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+          +      if (OB_FAIL(common::ObCharset::charset_convert(
+          +              allocator, word.get_word().get_string(), word.get_collation_type(),
+          +              stopword_type_.get_collation_type(), cmp_str))) {
+                 } else {
+          +        ret = lookup(cmp_str);
+                 }
+               }
+          +    if (OB_HASH_NOT_EXIST == ret) {
+          +      is_stopword = false;
+          +      ret = OB_SUCCESS;
+          +    } else if (OB_HASH_EXIST == ret) {
+          +      is_stopword = true;
+          +      ret = OB_SUCCESS;
+          +    } else if (OB_SUCC(ret)) {
+          +      ret = OB_ERR_UNEXPECTED;
+          +    }
+             }
+             return ret;
+           }
+          @@ -198,20 +201,19 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
+           int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
+           {
+             int ret = OB_SUCCESS;
+          -  int64_t word_count = 0;
+             if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
+               ret = OB_INVALID_ARGUMENT;
+             } else if (!flag_.groupby_word()) {
+               if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
+               }
+          -  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
+             } else {
+          -    if (OB_HASH_NOT_EXIST == ret) {
+          -      word_count = 1;
+          -    } else {
+          -      word_count += word_freq;
+          -    }
+          -    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+          +    auto increment = [&word, word_freq](hash::HashMapPair<ObFTWord, int64_t> &entry) {
+          +      entry.first = word;
+          +      entry.second += word_freq;
+          +    };
+          +    // Match overwrite semantics, including the latest spelling of keys that
+          +    // compare equal under the collation (cafe/café), using one probe.
+          +    if (OB_FAIL(word_map_.set_or_update(word, 1, increment))) {
+               }
+             }
+             return ret;
+          diff --git a/src/storage/fts/ob_fts_stop_word.h b/src/storage/fts/ob_fts_stop_word.h
+          index cbe0ff2..4083a21 100644
+          --- a/src/storage/fts/ob_fts_stop_word.h
+          +++ b/src/storage/fts/ob_fts_stop_word.h
+          @@ -82,7 +82,8 @@ public:
+           
+           private:
+             static const int64_t DEFAULT_STOPWORD_BUCKET_NUM = 37L;
+          -  typedef common::hash::ObHashSet<storage::ObFTWord> StopWordSet;
+          +  // Initialized before parser workers start and immutable until shutdown.
+          +  typedef common::hash::ObHashSet<storage::ObFTWord, common::hash::NoPthreadDefendMode> StopWordSet;
+           
+             StopWordSet stopword_set_;
+             ObObjMeta stopword_type_;
+          diff --git a/src/storage/fts/ob_ik_ft_parser.cpp b/src/storage/fts/ob_ik_ft_parser.cpp
+          index 5c574f1..2c99497 100644
+          --- a/src/storage/fts/ob_ik_ft_parser.cpp
+          +++ b/src/storage/fts/ob_ik_ft_parser.cpp
+          @@ -52,7 +52,7 @@ int ObIKFTParser::init(const ObFTParserParam &param)
+                 ret = OB_INVALID_ARGUMENT;
+               } else if (CS_TYPE_INVALID == (coll_type_ = ObCharset::collation_type(param.cs_->name))) {
+                 ret = OB_INVALID_ARGUMENT;
+          -    } else if (OB_FAIL(init_dict(param))) {
+          +    } else if (OB_FAIL(init_dict())) {
+               } else if (OB_FAIL(init_ctx(param))) {
+               } else if (OB_FAIL(init_segmenter(param))) {
+               }
+          @@ -90,19 +90,11 @@ int ObIKFTParser::get_next_token(const char *&word,
+                   } else {
+                   }
+                 } else {
+          -        bool is_stop = false;
+          -        // if (!OB_ISNULL(dict_stop_)
+          -        //     && OB_FAIL(dict_stop_->match(ObString(len, output_word + offset), is_stop))) {
+          -        //   LOG_WARN("Failed to match stopwords", K(ret));
+          -        // } else
+          -        if (!is_stop) {
+          -          word = output_word + offset;
+          -          word_len = len;
+          -          char_cnt = cnt;
+          -          word_freq = 1;
+          -          accept_token = true;
+          -        } else {
+          -        }
+          +        word = output_word + offset;
+          +        word_len = len;
+          +        char_cnt = cnt;
+          +        word_freq = 1;
+          +        accept_token = true;
+                 }
+               }
+             }
+          @@ -138,7 +130,7 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
+             for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
+                  OB_SUCC(ret) && iter != segmenters_.end();
+                  iter++) {
+          -    if (OB_FAIL((*iter)->process(ctx))) {
+          +    if (OB_FAIL((*iter)->do_process(ctx, ch, char_len, type))) {
+               }
+             }
+             return ret;
+          @@ -228,59 +220,11 @@ int ObIKFTParserDesc::get_add_word_flag(ObAddWordFlag &flag) const
+             return ret;
+           }
+           
+          -int ObIKFTParser::init_dict(const ObFTParserParam &param)
+          -{
+          -  int ret = OB_SUCCESS;
+          -  ObIFTDict *tmp_dict = nullptr;
+          -
+          -  if (OB_ISNULL(hub_)) {
+          -    ret = OB_ERR_UNEXPECTED;
+          -  }
+          -
+          -  ObFTRangeDict *dict = nullptr;
+          -  ObFTDictDesc main_dict_desc("main_dict",
+          -                              ObFTDictType::DICT_IK_MAIN,
+          -                              ObCharsetType::CHARSET_UTF8MB4,
+          -                              ObCollationType::CS_TYPE_UTF8MB4_BIN);
+          -
+          -  ObFTDictDesc quan_dict_desc("quan_dict",
+          -                              ObFTDictType::DICT_IK_QUAN,
+          -                              ObCharsetType::CHARSET_UTF8MB4,
+          -                              ObCollationType::CS_TYPE_UTF8MB4_BIN);
+          -
+          -  ObFTDictDesc stopword_dict_desc("stopword",
+          -                                  ObFTDictType::DICT_IK_STOP,
+          -                                  ObCharsetType::CHARSET_UTF8MB4,
+          -                                  ObCollationType::CS_TYPE_UTF8MB4_BIN);
+          -
+          -  if (should_read_newest_table()) {
+          -    // clear dict cache, always false now
+          -  } else {
+          -    if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
+          -    } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
+          -    } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
+          -    }
+          -  }
+          -
+          -  if (OB_FAIL(ret)) {
+          -    // already logged.
+          -  } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
+          -  } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
+          -  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
+          -  }
+          -
+          -  return ret;
+          -}
+          -
+          -int ObIKFTParser::init_single_dict(ObFTDictDesc desc, ObFTCacheRangeContainer &container)
+          +int ObIKFTParser::init_dict()
+           {
+             int ret = OB_SUCCESS;
+          -  if (OB_FAIL(hub_->load_cache(desc, container))) {
+          -    if (OB_ENTRY_NOT_EXIST == ret) {
+          -      if (OB_FAIL(hub_->build_cache(desc, container))) {
+          -      }
+          -    } else {
+          -    }
+          +  if (OB_FAIL(hub_->get_builtin_ik_dictionary(ObFTDictType::DICT_IK_MAIN, dict_main_))) {
+          +  } else if (OB_FAIL(hub_->get_builtin_ik_dictionary(ObFTDictType::DICT_IK_QUAN, dict_quan_))) {
+             }
+             return ret;
+           }
+          @@ -352,6 +296,7 @@ void ObIKFTParser::reset()
+             if (!OB_ISNULL(ctx_)) {
+               ctx_->~TokenizeContext();
+               allocator_.free(ctx_);
+          +    ctx_ = nullptr;
+             }
+           
+             for (ObIIKProcessor *segmenter : segmenters_) {
+          @@ -362,43 +307,11 @@ void ObIKFTParser::reset()
+             }
+             segmenters_.clear();
+           
+          -  cache_main_.reset();
+          -  cache_quan_.reset();
+          -  cache_stop_.reset();
+          -
+          -  if (!OB_ISNULL(dict_main_)) {
+          -    dict_main_->~ObIFTDict();
+          -    allocator_.free(dict_main_);
+          -  }
+          -  if (!OB_ISNULL(dict_quan_)) {
+          -    dict_quan_->~ObIFTDict();
+          -    allocator_.free(dict_quan_);
+          -  }
+          -  if (!OB_ISNULL(dict_stop_)) {
+          -    dict_stop_->~ObIFTDict();
+          -    allocator_.free(dict_stop_);
+          -  }
+          +  dict_main_ = nullptr;
+          +  dict_quan_ = nullptr;
+           
+             is_inited_ = false;
+           }
+           
+          -bool ObIKFTParser::should_read_newest_table() const { return false; }
+          -int ObIKFTParser::build_dict_from_cache(const ObFTDictDesc &desc,
+          -                                        ObFTCacheRangeContainer &container,
+          -                                        ObIFTDict *&dict)
+          -{
+          -  int ret = OB_SUCCESS;
+          -  if (OB_ISNULL(hub_)) {
+          -    ret = OB_ERR_UNEXPECTED;
+          -  } else if (OB_ISNULL(dict = OB_NEWx(ObFTRangeDict, &allocator_, allocator_, &container, desc))) {
+          -    ret = OB_ALLOCATE_MEMORY_FAILED;
+          -  } else if (OB_FAIL(dict->init())) {
+          -  }
+          -  if (OB_FAIL(ret)) {
+          -    OB_DELETEx(ObIFTDict, &allocator_, dict);
+          -  }
+          -  return ret;
+          -}
+          -
+           } //  namespace storage
+           } //  namespace oceanbase
+          diff --git a/src/storage/fts/ob_ik_ft_parser.h b/src/storage/fts/ob_ik_ft_parser.h
+          index e4efddf..68464a7 100644
+          --- a/src/storage/fts/ob_ik_ft_parser.h
+          +++ b/src/storage/fts/ob_ik_ft_parser.h
+          @@ -18,7 +18,6 @@
+           #define _OCEANBASE_STORAGE_FTS_OB_IK_FT_PARSER_H_
+           
+           #include "lib/allocator/ob_allocator.h"
+          -#include "storage/fts/dict/ob_ft_cache_container.h"
+           #include "storage/fts/dict/ob_ft_dict.h"
+           #include "storage/fts/dict/ob_ft_dict_def.h"
+           #include "storage/fts/ik/ob_ik_processor.h"
+          @@ -41,12 +40,8 @@ public:
+                   ctx_(nullptr),
+                   hub_(hub),
+                   segmenters_(allocator_),
+          -        cache_main_(allocator),
+          -        cache_quan_(allocator),
+          -        cache_stop_(allocator),
+                   dict_main_(nullptr),
+          -        dict_quan_(nullptr),
+          -        dict_stop_(nullptr)
+          +        dict_quan_(nullptr)
+             {
+             }
+           
+          @@ -72,9 +67,7 @@ private:
+                                  const ObFTCharUtil::CharType type);
+           
+           private:
+          -  int init_dict(const ObFTParserParam &param);
+          -
+          -  int init_single_dict(ObFTDictDesc desc, ObFTCacheRangeContainer &container);
+          +  int init_dict();
+           
+             int init_segmenter(const ObFTParserParam &param);
+           
+          @@ -82,12 +75,6 @@ private:
+           
+             void reset();
+           
+          -  bool should_read_newest_table() const;
+          -
+          -  int build_dict_from_cache(const ObFTDictDesc &desc,
+          -                            ObFTCacheRangeContainer &container,
+          -                            ObIFTDict *&dict);
+          -
+           private:
+             static constexpr int SEGMENT_LIMIT = 1000;
+             ObIAllocator &allocator_;
+          @@ -98,14 +85,9 @@ private:
+             ObFTDictHub *hub_;
+             ObList<ObIIKProcessor *, ObIAllocator> segmenters_;
+           
+          -  // For now there's no change of dict in one query, so we can pin dict this level.
+          -  ObFTCacheRangeContainer cache_main_;
+          -  ObFTCacheRangeContainer cache_quan_;
+          -  ObFTCacheRangeContainer cache_stop_;
+          -
+          -  ObIFTDict *dict_main_;
+          -  ObIFTDict *dict_quan_;
+          -  ObIFTDict *dict_stop_;
+          +  // Borrow immutable, owned snapshots from the process dictionary hub.
+          +  const ObIFTDict *dict_main_;
+          +  const ObIFTDict *dict_quan_;
+           
+             DISABLE_COPY_ASSIGN(ObIKFTParser);
+           };
+          diff --git a/src/storage/retrieval/ob_sparse_daat_iter.cpp b/src/storage/retrieval/ob_sparse_daat_iter.cpp
+          index fd8e299..14b1340 100644
+          --- a/src/storage/retrieval/ob_sparse_daat_iter.cpp
+          +++ b/src/storage/retrieval/ob_sparse_daat_iter.cpp
+          @@ -441,9 +441,11 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
+               ObDatum &id_proj_datum = id_proj_expr->locate_datum_for_write(*eval_ctx);
+               set_datum_func_(id_proj_datum, buffered_domain_ids_[0]);
+               id_proj_expr->set_evaluated_projected(*eval_ctx);
+          -    ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+          -    relevance_proj_datum.set_double(buffered_relevances_[0]);
+          -    relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+          +    if (iter_param_->need_project_relevance()) {
+          +      ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+          +      relevance_proj_datum.set_double(buffered_relevances_[0]);
+          +      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+          +    }
+             }
+             return ret;
+           }
+          diff --git a/src/storage/retrieval/ob_text_daat_iter.cpp b/src/storage/retrieval/ob_text_daat_iter.cpp
+          index 7836d0f..8417cfe 100644
+          --- a/src/storage/retrieval/ob_text_daat_iter.cpp
+          +++ b/src/storage/retrieval/ob_text_daat_iter.cpp
+          @@ -30,7 +30,8 @@ int ObTextDaaTIter::init(const ObTextDaaTParam &param)
+               ret = OB_INVALID_ARGUMENT;
+             } else if (OB_FAIL(ObSRDaaTIterImpl::init(*param.base_param_, *param.dim_iters_,
+                                                       *param.allocator_, *param.relevance_collector_))) {
+          -  } else if (OB_FAIL(bm25_param_estimator_.init(param.bm25_param_est_ctx_))) {
+          +  } else if (param.base_param_->need_project_relevance()
+          +             && OB_FAIL(bm25_param_estimator_.init(param.bm25_param_est_ctx_))) {
+             } else {
+               mode_flag_ = param.mode_flag_;
+               function_lookup_mode_ = param.function_lookup_mode_;
+          diff --git a/src/storage/retrieval/ob_text_retrieval_token_iter.cpp b/src/storage/retrieval/ob_text_retrieval_token_iter.cpp
+          index db785b0..9df1c61 100644
+          --- a/src/storage/retrieval/ob_text_retrieval_token_iter.cpp
+          +++ b/src/storage/retrieval/ob_text_retrieval_token_iter.cpp
+          @@ -78,6 +78,8 @@ int ObTextRetrievalTokenIter::init(const ObTextRetrievalScanIterParam &iter_para
+             } else if (OB_ISNULL(inv_scan_doc_length_col_)) {
+               ret = OB_ERR_UNEXPECTED;
+             } else if (OB_FAIL(init_calc_exprs_in_relevance_expr())) {
+          +  }
+          +  if (OB_FAIL(ret)) {
+             } else if (OB_ISNULL(skip_ = sql::to_bit_vector(
+                                      allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
+               ret = OB_ALLOCATE_MEMORY_FAILED;
+          @@ -203,7 +205,7 @@ int ObTextRetrievalTokenIter::get_next_row()
+             int ret = OB_SUCCESS;
+             if (IS_NOT_INIT) {
+               ret = OB_NOT_INIT;
+          -  } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
+          +  } else if (need_calc_relevance() && !token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
+             } else if (OB_FAIL(query::das_scan_next_row(inv_idx_scan_iter_))) {
+               if (OB_UNLIKELY(OB_ITER_END != ret)) {
+               }
+          @@ -242,7 +244,7 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
+             count = 0;
+             if (IS_NOT_INIT) {
+               ret = OB_NOT_INIT;
+          -  } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
+          +  } else if (need_calc_relevance() && !token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
+             } else if (OB_FAIL(query::das_scan_next_rows(
+                            inv_idx_scan_iter_, count, OB_MIN(max_batch_size_, capacity)))) {
+               if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          @@ -302,10 +304,11 @@ int ObTextRetrievalTokenIter::advance_to(const ObDatum &id_datum)
+           int ObTextRetrievalTokenIter::update_scan_param(const ObString &token, common::ObArenaAllocator &allocator)
+           {
+             int ret = OB_SUCCESS;
+          -  if (OB_UNLIKELY(inv_idx_agg_param_->key_ranges_.count() != 1)) {
+          +  const auto &ranges = need_inv_idx_agg() ? inv_idx_agg_param_->key_ranges_ : inv_idx_scan_param_->key_ranges_;
+          +  if (OB_UNLIKELY(ranges.count() != 1)) {
+               ret = OB_ERR_UNEXPECTED;
+             } else {
+          -    ObNewRange scan_range = inv_idx_agg_param_->key_ranges_.at(0);
+          +    ObNewRange scan_range = ranges.at(0);
+               ObObj tmp_obj;
+               tmp_obj.set_string(ObVarcharType, token);
+               tmp_obj.set_meta_type(scan_range.start_key_.get_obj_ptr()->meta_);
+          diff --git a/src/storage/retrieval/ob_text_taat_iter.cpp b/src/storage/retrieval/ob_text_taat_iter.cpp
+          index 25edf5a..4a98c4e 100644
+          --- a/src/storage/retrieval/ob_text_taat_iter.cpp
+          +++ b/src/storage/retrieval/ob_text_taat_iter.cpp
+          @@ -32,7 +32,8 @@ int ObTextTaaTIter::init(const ObTextTaaTParam &param)
+               ret = OB_INVALID_ARGUMENT;
+             } else if (OB_FAIL(CURRENT_CONTEXT->CREATE_CONTEXT(mem_context_, mem_param))) {
+             } else if (OB_FAIL(ObSRTaaTIterImpl::init(*param.base_param_, *param.dim_iter_, *param.allocator_))) {
+          -  } else if (OB_FAIL(bm25_param_estimator_.init(param.bm25_param_est_ctx_))) {
+          +  } else if (param.base_param_->need_project_relevance()
+          +             && OB_FAIL(bm25_param_estimator_.init(param.bm25_param_est_ctx_))) {
+             } else {
+               query_tokens_ = param.query_tokens_;
+               mode_flag_ = param.mode_flag_;
+          @@ -72,6 +73,8 @@ int ObTextTaaTIter::pre_process()
+                 const int64_t total_doc_cnt = bm25_param_estimator_.get_total_doc_cnt();
+                 partition_cnt_ = MIN((total_doc_cnt-1) / OB_HASHMAP_DEFAULT_SIZE + 1, OB_MAX_HASHMAP_COUNT);
+               }
+          +  } else if (partition_cnt_ == 0 && query_tokens_->count() > 0) {
+          +    partition_cnt_ = 1;
+             }
+             return ret;
+           }
+          diff --git a/unittest/sql/engine/expr/test_fts_boolean_retrieval.py b/unittest/sql/engine/expr/test_fts_boolean_retrieval.py
+          new file mode 100644
+          index 0000000..ce6a5e2
+          --- /dev/null
+          +++ b/unittest/sql/engine/expr/test_fts_boolean_retrieval.py
+          @@ -0,0 +1,128 @@
+          +"""Check real postings, score consumers and transactional visibility together.
+          +
+          +Run against a native seekdb with pymysql installed. The temporary database is
+          +owned by this test and removed on completion. EXPECT_BOOLEAN_ELISION=1 also
+          +checks the optimized plan; the behavioral assertions run on the baseline.
+          +"""
+          +
+          +import os
+          +import unittest
+          +import uuid
+          +
+          +from test_tokenize_hot_path import connect
+          +
+          +
+          +class BooleanRetrieval(unittest.TestCase):
+          +    @classmethod
+          +    def setUpClass(cls):
+          +        cls.connection = connect()
+          +        cls.database = "fts_score_" + uuid.uuid4().hex[:12]
+          +        with cls.connection.cursor() as cursor:
+          +            cursor.execute(f"CREATE DATABASE {cls.database}")
+          +            cursor.execute(f"USE {cls.database}")
+          +            cursor.execute("CREATE TABLE docs(id INT PRIMARY KEY, body TEXT)")
+          +            cursor.executemany("INSERT INTO docs VALUES (%s,%s)", [
+          +                (1, "common database database audit"),
+          +                (2, "common database performance"),
+          +                (3, "common audit"),
+          +                (4, "common unrelated"),
+          +                (5, None), (6, ""), (7, "the and a"),
+          +            ])
+          +            cursor.execute("ALTER TABLE docs ADD FULLTEXT INDEX ft(body) WITH PARSER beng")
+          +
+          +    @classmethod
+          +    def tearDownClass(cls):
+          +        with cls.connection.cursor() as cursor:
+          +            cursor.execute(f"DROP DATABASE {cls.database}")
+          +        cls.connection.close()
+          +
+          +    def rows(self, sql, parameters=None):
+          +        with self.connection.cursor() as cursor:
+          +            cursor.execute(sql, parameters)
+          +            return cursor.fetchall()
+          +
+          +    def test_postings_match_numeric_predicate_and_empty_queries(self):
+          +        for query in ("database", "database audit", "common", "absent", "", "the and", None):
+          +            with self.subTest(query=query):
+          +                boolean = self.rows("SELECT id FROM docs WHERE MATCH(body) AGAINST(%s) ORDER BY id", (query,))
+          +                numeric = self.rows("SELECT id FROM docs WHERE MATCH(body) AGAINST(%s)>0.0 ORDER BY id", (query,))
+          +                self.assertEqual(boolean, numeric)
+          +        self.assertEqual(self.rows("SELECT id FROM docs WHERE MATCH(body) AGAINST('common') ORDER BY id"),
+          +                         ((1,), (2,), (3,), (4,)))
+          +        self.assertEqual(self.rows("SELECT id FROM docs WHERE MATCH(body) AGAINST('database') ORDER BY id LIMIT 1 OFFSET 1"),
+          +                         ((2,),))
+          +
+          +    def test_large_term_set_and_boolean_mode(self):
+          +        query = "database " + " ".join(f"absentterm{i}" for i in range(300))
+          +        self.assertEqual(self.rows("SELECT id FROM docs WHERE MATCH(body) AGAINST(%s) ORDER BY id", (query,)),
+          +                         ((1,), (2,)))
+          +        self.assertEqual(self.rows(
+          +            "SELECT id FROM docs WHERE MATCH(body) AGAINST('+database -audit' IN BOOLEAN MODE) ORDER BY id"),
+          +            ((2,),))
+          +
+          +    def test_projected_ranked_threshold_and_nested_score_consumers(self):
+          +        select = "SELECT id,MATCH(body) AGAINST('database') score FROM docs "
+          +        boolean = self.rows(select + "WHERE MATCH(body) AGAINST('database') ORDER BY id")
+          +        numeric = self.rows(select + "WHERE MATCH(body) AGAINST('database')>0.0 ORDER BY id")
+          +        self.assertEqual(boolean, numeric)
+          +        self.assertEqual([row[0] for row in boolean], [1, 2])
+          +        self.assertTrue(all(row[1] > 0.0 for row in boolean))
+          +        ranked = self.rows(select + "WHERE MATCH(body) AGAINST('database') ORDER BY score DESC,id LIMIT 2")
+          +        self.assertEqual(ranked, tuple(sorted(boolean, key=lambda row: (-row[1], row[0]))))
+          +        threshold = sum(row[1] for row in boolean) / 2
+          +        self.assertEqual(self.rows(select + "WHERE MATCH(body) AGAINST('database')>%s ORDER BY id", (threshold,)),
+          +                         tuple(row for row in boolean if row[1] > threshold))
+          +        nested = self.rows("SELECT id,ROUND(MATCH(body) AGAINST('database')*100,8) FROM docs "
+          +                           "WHERE MATCH(body) AGAINST('database') ORDER BY id")
+          +        self.assertEqual(nested, tuple((row[0], round(row[1] * 100, 8)) for row in boolean))
+          +
+          +    def test_original_text_projection_filter_and_sort(self):
+          +        bodies = ((1, "common database database audit"), (2, "common database performance"))
+          +        self.assertEqual(self.rows("SELECT id,body FROM docs WHERE MATCH(body) AGAINST('database') ORDER BY id"),
+          +                         bodies)
+          +        self.assertEqual(self.rows("SELECT id FROM docs WHERE MATCH(body) AGAINST('database') "
+          +                                   "AND body LIKE '%audit%' ORDER BY id"), ((1,),))
+          +        self.assertEqual(self.rows("SELECT SUM(LENGTH(body)) FROM docs WHERE MATCH(body) AGAINST('database')"),
+          +                         ((sum(len(body) for _, body in bodies),),))
+          +        self.assertEqual(self.rows("SELECT id FROM docs WHERE MATCH(body) AGAINST('database') "
+          +                                   "ORDER BY LENGTH(body),id LIMIT 1"), ((2,),))
+          +        self.assertEqual(self.rows("SELECT COUNT(*) FROM docs d JOIN docs x ON x.id=d.id "
+          +                                   "WHERE MATCH(d.body) AGAINST('database') AND x.body LIKE '%audit%'"), ((1,),))
+          +
+          +    def test_live_update_delete_insert_and_rollback(self):
+          +        try:
+          +            self.rows("UPDATE docs SET body='common database' WHERE id=4")
+          +            self.rows("DELETE FROM docs WHERE id=2")
+          +            self.rows("INSERT INTO docs VALUES(8,'common database')")
+          +            self.assertEqual(self.rows("SELECT id FROM docs WHERE MATCH(body) AGAINST('database') ORDER BY id"),
+          +                             ((1,), (4,), (8,)))
+          +            self.rows("START TRANSACTION")
+          +            self.rows("UPDATE docs SET body='unrelated' WHERE id=1")
+          +            self.rows("ROLLBACK")
+          +            self.assertEqual(self.rows("SELECT id FROM docs WHERE MATCH(body) AGAINST('database') ORDER BY id"),
+          +                             ((1,), (4,), (8,)))
+          +        finally:
+          +            self.rows("ROLLBACK")
+          +            self.rows("UPDATE docs SET body='common unrelated' WHERE id=4")
+          +            self.rows("INSERT INTO docs VALUES(2,'common database performance')")
+          +            self.rows("DELETE FROM docs WHERE id=8")
+          +
+          +    def test_plans_keep_numeric_score_consumers(self):
+          +        if os.environ.get("EXPECT_BOOLEAN_ELISION") != "1":
+          +            return
+          +        plain = " ".join(str(value) for row in self.rows(
+          +            "EXPLAIN SELECT COUNT(*) FROM docs WHERE MATCH(body) AGAINST('database')") for value in row)
+          +        ranked = " ".join(str(value) for row in self.rows(
+          +            "EXPLAIN SELECT id,MATCH(body) AGAINST('database') score FROM docs "
+          +            "WHERE MATCH(body) AGAINST('database') ORDER BY score DESC") for value in row)
+          +        self.assertIn("calc_relevance=false", plain)
+          +        self.assertIn("calc_relevance=true", ranked)
+          +        if os.environ.get("EXPECT_FTS_COVERING") == "1":
+          +            self.assertIn("index_back=false", plain)
+          +            projected = " ".join(str(value) for row in self.rows(
+          +                "EXPLAIN SELECT body FROM docs WHERE MATCH(body) AGAINST('database')") for value in row)
+          +            self.assertIn("index_back=true", projected)
+          +
+          +
+          +if __name__ == "__main__":
+          +    unittest.main()
+          diff --git a/unittest/sql/engine/expr/test_tokenize_hot_path.py b/unittest/sql/engine/expr/test_tokenize_hot_path.py
+          new file mode 100644
+          index 0000000..96e7e6c
+          --- /dev/null
+          +++ b/unittest/sql/engine/expr/test_tokenize_hot_path.py
+          @@ -0,0 +1,97 @@
+          +"""Native TOKENIZE regression for local maps and immutable stopword lookup.
+          +
+          +Run with a seekdb instance built from this checkout:
+          +    SEEKDB_PORT=2881 python unittest/sql/engine/expr/test_tokenize_hot_path.py
+          +Requires pymysql. These checks issue SELECT statements only.
+          +"""
+          +
+          +from concurrent.futures import ThreadPoolExecutor
+          +import json
+          +import os
+          +import unittest
+          +
+          +import pymysql
+          +
+          +
+          +def connect():
+          +    return pymysql.connect(
+          +        host=os.environ.get("SEEKDB_HOST", "127.0.0.1"),
+          +        port=int(os.environ.get("SEEKDB_PORT", "2881")),
+          +        user=os.environ.get("SEEKDB_USER", "root"),
+          +        password=os.environ.get("SEEKDB_PASSWORD", ""),
+          +        charset="utf8mb4",
+          +        autocommit=True,
+          +    )
+          +
+          +
+          +def tokenize(connection, text, parser, expression="%s", options=None):
+          +    with connection.cursor() as cursor:
+          +        cursor.execute(
+          +            f"SELECT tokenize({expression},%s,%s) AS tokens",
+          +            (text, parser, options or '[{"output":"all"}]'),
+          +        )
+          +        return json.loads(cursor.fetchone()[0])
+          +
+          +
+          +class TokenizeHotPath(unittest.TestCase):
+          +    def test_a_concurrent_first_ik_use_preserves_independent_modes(self):
+          +        text = "中华人民共和国人民大会堂。三百二十个人正在学习数据库。"
+          +
+          +        def options(mode):
+          +            return json.dumps([{"output": "all"}, {"additional_args": [{"ik_mode": mode}]}])
+          +
+          +        def check(worker):
+          +            mode = "smart" if worker % 2 == 0 else "max_word"
+          +            with connect() as connection:
+          +                return mode, tokenize(connection, text, "ik", options=options(mode))
+          +
+          +        with ThreadPoolExecutor(max_workers=8) as pool:
+          +            parallel = list(pool.map(check, range(8)))
+          +        with connect() as connection:
+          +            expected = {mode: tokenize(connection, text, "ik", options=options(mode))
+          +                        for mode in ("smart", "max_word")}
+          +        self.assertNotEqual(expected["smart"], expected["max_word"])
+          +        for mode, result in parallel:
+          +            self.assertEqual(result, expected[mode])
+          +
+          +    def test_collation_equal_words_keep_the_last_spelling_and_full_frequency(self):
+          +        with connect() as connection:
+          +            for parser in ("beng", "space"):
+          +                for text, spelling in (
+          +                    ("THE Café cafe", "cafe"),
+          +                    ("THE cafe CAFÉ", "café"),
+          +                ):
+          +                    with self.subTest(parser=parser, text=text):
+          +                        self.assertEqual(
+          +                            tokenize(connection, text, parser),
+          +                            {"doc_len": 2, "tokens": [{spelling: 2}]},
+          +                        )
+          +
+          +    def test_stopword_lookup_across_supported_collations(self):
+          +        with connect() as connection:
+          +            for collation in ("utf8mb4_general_ci", "utf8mb4_bin"):
+          +                with self.subTest(collation=collation):
+          +                    value = tokenize(
+          +                        connection,
+          +                        "THE coffee coffee",
+          +                        "space",
+          +                        f"%s COLLATE {collation}",
+          +                    )
+          +                    self.assertEqual(value, {"doc_len": 2, "tokens": [{"coffee": 2}]})
+          +
+          +    def test_concurrent_parsers_do_not_share_document_state(self):
+          +        def check(worker):
+          +            with connect() as connection:
+          +                for index in range(20):
+          +                    word = f"tenant{worker}value{index}"
+          +                    self.assertEqual(
+          +                        tokenize(connection, f"THE {word} {word}", "beng"),
+          +                        {"doc_len": 2, "tokens": [{word: 2}]},
+          +                    )
+          +
+          +        with ThreadPoolExecutor(max_workers=8) as pool:
+          +            list(pool.map(check, range(8)))
+          +
+          +
+          +if __name__ == "__main__":
+          +    unittest.main()
+          FTS_2026_REVIEWED_PATCH
+          git apply --check ../reviewed.patch
+          git apply ../reviewed.patch
+          git diff --check
+          git config user.name 'lycegg+gpt'
+          git config user.email '821853076@qq.com'
+          git add --all
+          git -c commit.gpgsign=false commit -m 'Optimize FTS dictionary ownership, local token maps and unscored retrieval'
+          git rev-parse HEAD
+      - name: Publish the answer without rewriting an existing branch
+        working-directory: answer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          askpass=$(mktemp)
+          trap 'rm -f "$askpass"' EXIT
+          cat > "$askpass" <<'GIT_ASKPASS_SCRIPT'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *) printf '%s\n' "$GH_TOKEN" ;;
+          esac
+          GIT_ASKPASS_SCRIPT
+          chmod 700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git -c credential.helper= push https://github.com/SakuraMarble/seekdb-haiku.git HEAD:refs/heads/codex/fts-2026
