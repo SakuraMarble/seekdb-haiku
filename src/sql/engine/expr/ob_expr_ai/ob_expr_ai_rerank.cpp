@@ -102,6 +102,11 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
   ObDatum *arg_documents = nullptr;
   ObDatum *arg_doc_key = nullptr;
   if (OB_FAIL(expr.eval_param_value(ctx, arg_model_id, arg_query, arg_documents, arg_doc_key))) {
+  } else if (OB_NOT_NULL(arg_doc_key) && arg_doc_key->is_null()) {
+    // An explicit SQL NULL selects the string-array overload.
+    arg_doc_key = nullptr;
+  }
+  if (OB_FAIL(ret)) {
   } else if (arg_model_id->is_null() || arg_query->is_null() || arg_documents->is_null()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_rerank, model id or query or documents is null");
@@ -286,7 +291,7 @@ int ObExprAIRerank::sort_document_array_by_model_result(ObIAllocator &allocator,
         ret = OB_ERR_UNEXPECTED;
       } else {
         ObJsonInt *index_value = static_cast<ObJsonInt *>(model_result_obj->get_value(INDEX_KEY));
-        ObJsonDouble *score_value = static_cast<ObJsonDouble *>(model_result_obj->get_value(SCORE_KEY));
+        ObJsonNode *score_value = model_result_obj->get_value(SCORE_KEY);
         if (OB_ISNULL(index_value) || OB_ISNULL(score_value)) {
           ret = OB_ERR_UNEXPECTED;
         } else {
@@ -335,24 +340,9 @@ int ObExprAIRerank::inner_eval_ai_rerank(ObIAllocator &allocator,
                                           ObJsonArray *document_array, 
                                           ObJsonArray *&result_array)
 {
-  INIT_SUCC(ret);
-  ObJsonArray *res = nullptr;
-  ObJsonObject *config_json = nullptr;
-  ObJsonObject *body = nullptr;
-  ObJsonObject *http_response = nullptr;
-  ObIJsonBase *response = nullptr;
-  ObAIFuncClient ai_client;
-  if (OB_FAIL(ObAIFuncUtils::get_rerank_body(allocator, info, endpoint_info, query, document_array, config_json, body))) {
-  } else if (OB_FAIL(ai_client.send_post(allocator, endpoint_info.get_url(), header_array, body, http_response))) {
-  } else if (OB_FAIL(ObAIFuncUtils::parse_rerank_output(allocator, endpoint_info, http_response, response))) {
-  } else if (response->json_type() != ObJsonNodeType::J_ARRAY) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(res = static_cast<ObJsonArray *>(response))) {
-    ret = OB_ERR_UNEXPECTED;
-  } else {
-    result_array = res;
-  }
-  return ret;
+  UNUSED(header_array);
+  ObAIFuncModel model(allocator, info, endpoint_info);
+  return model.call_rerank(query, document_array, result_array);
 }
 
 int ObExprAIRerank::batch_result_add_base(ObIAllocator &allocator, ObJsonArray *array, int64_t start_idx)
@@ -385,10 +375,9 @@ int ObExprAIRerank::compact_json_array_by_key(ObIAllocator &allocator, ObJsonArr
   } else {
     int64_t count1 = array1->element_count();
     int64_t count2 = array2->element_count();
-    int64_t min_count = count1 < count2 ? count1 : count2;
     int64_t i = 0;
     int64_t j = 0;
-    while (i < min_count && j < min_count) {
+    while (OB_SUCC(ret) && i < count1 && j < count2) {
       ObJsonObject *obj1 = static_cast<ObJsonObject *>(array1->get_value(i));
       ObJsonObject *obj2 = static_cast<ObJsonObject *>(array2->get_value(j));
       if (OB_ISNULL(obj1) || OB_ISNULL(obj2)) {
@@ -399,7 +388,7 @@ int ObExprAIRerank::compact_json_array_by_key(ObIAllocator &allocator, ObJsonArr
         if (OB_ISNULL(double1) || OB_ISNULL(double2)) {
           ret = OB_ERR_UNEXPECTED;
         } else {
-          if (double1->value() > double2->value()) {
+          if (double1->value() >= double2->value()) {
             if (OB_FAIL(result_array->append(obj1))) {
             }
             i++;
