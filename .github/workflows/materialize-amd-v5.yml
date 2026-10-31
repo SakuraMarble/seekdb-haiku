@@ -1,0 +1,1040 @@
+name: Publish reviewed AMD V5 answer
+on:
+  push:
+    branches: [codex/bootstrap-amd-v5]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Fetch the immutable public contest baseline
+        run: |
+          git init answer
+          cd answer
+          git remote add contest-base https://github.com/zihaomu/seekdb.git
+          git config remote.contest-base.promisor true
+          git config remote.contest-base.partialclonefilter blob:none
+          git -c protocol.version=2 fetch --filter=blob:none --no-tags contest-base 634888d9b037153fa143d2c913ba4b25503e1d62
+          git checkout -b codex/amd-cagra-v5 FETCH_HEAD
+      - name: Apply the reviewed source patch
+        working-directory: answer
+        run: |
+          cat > ../reviewed.patch <<'AMD_V5_REVIEWED_PATCH'
+          diff --git a/benchmarks/cagra_bridge.py b/benchmarks/cagra_bridge.py
+          new file mode 100644
+          index 0000000..1c30c7f
+          --- /dev/null
+          +++ b/benchmarks/cagra_bridge.py
+          @@ -0,0 +1,149 @@
+          +"""Measure real bridge construction, scalar queries, recall, and snapshot recovery.
+          +
+          +This isolates the bridge; SQL DDL timing still requires a complete seekdb build.
+          +"""
+          +
+          +import argparse
+          +import ctypes as c
+          +import hashlib
+          +import json
+          +from pathlib import Path
+          +import resource
+          +import time
+          +import threading
+          +
+          +import numpy as np
+          +
+          +
+          +def main():
+          +    parser = argparse.ArgumentParser(description=__doc__)
+          +    parser.add_argument("library", type=Path)
+          +    parser.add_argument("--data", type=Path, default=Path("/seekdb_workspace/datasets"))
+          +    parser.add_argument("--dimension", type=int, default=128)
+          +    parser.add_argument("--rows", type=int)
+          +    parser.add_argument("--transient-threads", action="store_true", help="Match the adaptor's new thread per query")
+          +    args = parser.parse_args()
+          +    threading.stack_size(32 * 1024 * 1024)
+          +    soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+          +    resource.setrlimit(resource.RLIMIT_STACK, (hard, hard))
+          +    base = np.fromfile(args.data / "base.f32", dtype=np.float32).reshape(-1, args.dimension)
+          +    if args.rows:
+          +        base = np.ascontiguousarray(base[:args.rows])
+          +    queries = np.fromfile(args.data / "query.f32", dtype=np.float32).reshape(-1, args.dimension)
+          +    k_max = min(100, len(base))
+          +    exact = []
+          +    base64 = base.astype(np.float64)
+          +    squared = np.sum(base64 * base64, axis=1)
+          +    query64 = queries.astype(np.float64)
+          +    all_distances = squared[None, :] + np.sum(query64 * query64, axis=1)[:, None] - 2 * (query64 @ base64.T)
+          +    for distances in all_distances:
+          +        ids = np.argpartition(distances, k_max - 1)[:k_max]
+          +        ids = ids[np.lexsort((ids, distances[ids]))]
+          +        exact.append(ids)
+          +    del base64
+          +    del all_distances
+          +    library = c.CDLL(str(args.library.resolve()))
+          +    float_p, uint_p = c.POINTER(c.c_float), c.POINTER(c.c_uint)
+          +    library.seekdb_cuvs_build.argtypes = [float_p, c.c_long, c.c_long]
+          +    library.seekdb_cuvs_build.restype = c.c_void_p
+          +    library.seekdb_cuvs_search.argtypes = [c.c_void_p, float_p, c.c_long, c.c_long, uint_p, float_p]
+          +    library.seekdb_cuvs_search.restype = c.c_int
+          +    library.seekdb_cuvs_free.argtypes = [c.c_void_p]
+          +    library.seekdb_cuvs_serialize.argtypes = [c.c_void_p, c.c_char_p]
+          +    library.seekdb_cuvs_deserialize.argtypes = [c.c_char_p, c.c_long, c.c_long]
+          +    library.seekdb_cuvs_deserialize.restype = c.c_void_p
+          +
+          +    def execute_search(handle, query, k, check_distance=False):
+          +        ids = np.empty(k, dtype=np.uint32)
+          +        distances = np.empty(k, dtype=np.float32)
+          +        rc = library.seekdb_cuvs_search(
+          +            handle, query.ctypes.data_as(float_p), 1, k,
+          +            ids.ctypes.data_as(uint_p), distances.ctypes.data_as(float_p),
+          +        )
+          +        if rc:
+          +            raise RuntimeError(f"GPU search failed: {rc}")
+          +        if len(set(map(int, ids))) != k or np.any(ids >= len(base)) or not np.isfinite(distances).all():
+          +            raise RuntimeError("invalid GPU result identities or distances")
+          +        if check_distance:
+          +            expected = np.sum((base[ids].astype(np.float64) - query.astype(np.float64)) ** 2, axis=1)
+          +            if not np.allclose(distances, expected, rtol=1e-4, atol=2e-5):
+          +                raise RuntimeError("GPU distances differ from original FP32 squared L2")
+          +        return ids
+          +
+          +    def search(handle, query, k):
+          +        if not args.transient_threads:
+          +            return execute_search(handle, query, k)
+          +        result, errors = [], []
+          +
+          +        def invoke():
+          +            try:
+          +                result.append(execute_search(handle, query, k))
+          +            except Exception as error:
+          +                errors.append(error)
+          +
+          +        worker = threading.Thread(target=invoke)
+          +        worker.start()
+          +        worker.join()
+          +        if errors:
+          +            raise errors[0]
+          +        return result[0]
+          +
+          +    start = time.perf_counter()
+          +    handle = library.seekdb_cuvs_build(base.ctypes.data_as(float_p), len(base), args.dimension)
+          +    if not handle:
+          +        raise RuntimeError("GPU construction failed")
+          +    report = {
+          +        "library": str(args.library), "rows": len(base), "dimension": args.dimension,
+          +        "transient_threads": args.transient_threads,
+          +    }
+          +    snapshot = args.library.with_suffix(".snapshot")
+          +    recovered_snapshot = args.library.with_suffix(".recovered.snapshot")
+          +    try:
+          +        search(handle, queries[0], min(10, len(base)))
+          +        report["build_and_first_query_seconds"] = time.perf_counter() - start
+          +        for k in sorted({min(10, len(base)), k_max}):
+          +            latency, recall = [], []
+          +            for i, query in enumerate(queries):
+          +                begin = time.perf_counter()
+          +                ids = search(handle, query, k)
+          +                latency.append((time.perf_counter() - begin) * 1000)
+          +                recall.append(len(set(map(int, ids)) & set(map(int, exact[i][:k]))) / k)
+          +            report[f"p50_query_ms_at_{k}"] = float(np.median(latency))
+          +            report[f"recall_at_{k}"] = float(np.mean(recall))
+          +        before = search(handle, queries[0], k_max)
+          +        repeated = search(handle, queries[0], k_max)
+          +        report["repeat_id_overlap"] = len(set(map(int, before)) & set(map(int, repeated))) / k_max
+          +        for query in queries[:5]:
+          +            execute_search(handle, query, k_max, check_distance=True)
+          +        report["original_l2_distances_verified"] = True
+          +        if library.seekdb_cuvs_serialize(handle, str(snapshot).encode()):
+          +            raise RuntimeError("snapshot write failed")
+          +    finally:
+          +        library.seekdb_cuvs_free(handle)
+          +    handle = library.seekdb_cuvs_deserialize(str(snapshot).encode(), len(base), args.dimension)
+          +    if not handle:
+          +        raise RuntimeError("snapshot load failed")
+          +    try:
+          +        after = search(handle, queries[0], k_max)
+          +        report["snapshot_same_ids"] = bool(np.array_equal(before, after))
+          +        report["snapshot_id_overlap"] = len(set(map(int, before)) & set(map(int, after))) / k_max
+          +        if library.seekdb_cuvs_serialize(handle, str(recovered_snapshot).encode()):
+          +            raise RuntimeError("recovered snapshot write failed")
+          +        def digest(path):
+          +            with path.open("rb") as stream:
+          +                return hashlib.file_digest(stream, "sha256").hexdigest()
+          +        report["snapshot_bytes_identical"] = digest(snapshot) == digest(recovered_snapshot)
+          +        for query in queries[:5]:
+          +            execute_search(handle, query, k_max, check_distance=True)
+          +    finally:
+          +        library.seekdb_cuvs_free(handle)
+          +        recovered_snapshot.unlink(missing_ok=True)
+          +    print(json.dumps(report, sort_keys=True), flush=True)
+          +    # CAGRA traversal can vary between calls. Verify the graph and dataset are
+          +    # preserved byte-for-byte rather than requiring a deterministic traversal.
+          +    if not report["snapshot_bytes_identical"]:
+          +        raise RuntimeError("snapshot changed graph or dataset bytes")
+          +
+          +
+          +if __name__ == "__main__":
+          +    main()
+          diff --git a/benchmarks/make_synthetic.py b/benchmarks/make_synthetic.py
+          new file mode 100644
+          index 0000000..536edcd
+          --- /dev/null
+          +++ b/benchmarks/make_synthetic.py
+          @@ -0,0 +1,28 @@
+          +"""Generate independent FP32 unit-vector data for local CAGRA stress testing."""
+          +
+          +import argparse
+          +import json
+          +from pathlib import Path
+          +
+          +import numpy as np
+          +
+          +parser = argparse.ArgumentParser(description=__doc__)
+          +parser.add_argument("output", type=Path)
+          +parser.add_argument("--rows", type=int, default=250000)
+          +parser.add_argument("--dimension", type=int, default=256)
+          +parser.add_argument("--queries", type=int, default=100)
+          +parser.add_argument("--seed", type=int, default=20261031)
+          +args = parser.parse_args()
+          +args.output.mkdir(parents=True, exist_ok=True)
+          +rng = np.random.default_rng(args.seed)
+          +for name, rows in (("base", args.rows), ("query", args.queries)):
+          +    values = rng.standard_normal((rows, args.dimension), dtype=np.float32)
+          +    values /= np.linalg.norm(values, axis=1, keepdims=True)
+          +    values.tofile(args.output / f"{name}.f32")
+          +manifest = {
+          +    "distribution": "independent standard Gaussian, normalized to unit L2 length",
+          +    "rows": args.rows, "dimension": args.dimension, "queries": args.queries, "seed": args.seed,
+          +    "purpose": "development stress data; not competition data or an official score",
+          +}
+          +(args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          +print(json.dumps(manifest))
+          diff --git a/benchmarks/sql_cagra.py b/benchmarks/sql_cagra.py
+          new file mode 100644
+          index 0000000..7c9ea04
+          --- /dev/null
+          +++ b/benchmarks/sql_cagra.py
+          @@ -0,0 +1,90 @@
+          +"""Measure CAGRA through seekdb's real CREATE INDEX and scalar SQL paths.
+          +
+          +The caller selects the bridge with LD_LIBRARY_PATH when starting the server.
+          +Data loading and exact CPU ground truth are outside the measured interval.
+          +Only the dedicated amd_sql_validation database is modified.
+          +"""
+          +
+          +import argparse
+          +import json
+          +from pathlib import Path
+          +import time
+          +
+          +import numpy as np
+          +import pymysql
+          +
+          +
+          +parser = argparse.ArgumentParser(description=__doc__)
+          +parser.add_argument("mode", choices=("prepare", "measure"))
+          +parser.add_argument("--root", type=Path, default=Path("/workspace/codex-v5-bridge"))
+          +parser.add_argument("--label", default="baseline")
+          +parser.add_argument("--port", type=int, default=2883)
+          +args = parser.parse_args()
+          +connection = pymysql.connect(host="127.0.0.1", port=args.port, user="root", autocommit=True,
+          +                             read_timeout=1200, write_timeout=1200)
+          +reports = []
+          +with connection.cursor() as cursor:
+          +    cursor.execute("CREATE DATABASE IF NOT EXISTS amd_sql_validation")
+          +    cursor.execute("USE amd_sql_validation")
+          +    for dataset, dimension, table in (("sift250k", 128, "sift"),
+          +                                       ("synthetic250k-d256", 256, "unit_vectors")):
+          +        base = np.fromfile(args.root / dataset / "base.f32", dtype=np.float32).reshape(-1, dimension)
+          +        queries = np.fromfile(args.root / dataset / "query.f32", dtype=np.float32).reshape(-1, dimension)
+          +        if args.mode == "prepare":
+          +            cursor.execute(f"CREATE TABLE IF NOT EXISTS {table}(id BIGINT PRIMARY KEY,v VECTOR({dimension}))")
+          +            cursor.execute(f"SELECT COUNT(*) FROM {table}")
+          +            existing = cursor.fetchone()[0]
+          +            if existing not in (0, len(base)):
+          +                raise RuntimeError(f"incomplete owned table {table}: {existing}")
+          +            if not existing:
+          +                start = time.perf_counter()
+          +                for first in range(0, len(base), 1000):
+          +                    rows = [(first + i, json.dumps(v.tolist(), separators=(",", ":")))
+          +                            for i, v in enumerate(base[first:first + 1000])]
+          +                    cursor.executemany(f"INSERT INTO {table}(id,v) VALUES(%s,%s)", rows)
+          +                    if first % 25000 == 0:
+          +                        print("import", dataset, first + len(rows), time.perf_counter() - start, flush=True)
+          +            cursor.execute(f"SELECT COUNT(*) FROM {table}")
+          +            assert cursor.fetchone()[0] == len(base)
+          +            print("prepared", dataset, len(base), flush=True)
+          +            continue
+          +        # Independent FP64 exact neighbours. No judge answers or hidden labels.
+          +        base64 = base.astype(np.float64)
+          +        query64 = queries.astype(np.float64)
+          +        distances = (np.sum(base64 * base64, axis=1)[None, :]
+          +                     + np.sum(query64 * query64, axis=1)[:, None] - 2 * (query64 @ base64.T))
+          +        exact = []
+          +        for distance in distances:
+          +            ids = np.argpartition(distance, 99)[:100]
+          +            exact.append(ids[np.lexsort((ids, distance[ids]))])
+          +        del base64, distances
+          +        literals = [json.dumps(q.tolist(), separators=(",", ":")) for q in queries]
+          +
+          +        def query(index, k):
+          +            cursor.execute(f"SELECT id FROM {table} ORDER BY l2_distance(v,'{literals[index]}') APPROXIMATE LIMIT {k}")
+          +            return [row[0] for row in cursor.fetchall()]
+          +
+          +        start = time.perf_counter()
+          +        cursor.execute(f"CREATE VECTOR INDEX idx_cagra ON {table}(v) "
+          +                       "WITH(distance=l2,type=hnsw,lib=cuvs,m=16,ef_construction=200,ef_search=64)")
+          +        query(0, 10)
+          +        report = {"label": args.label, "dataset": dataset, "rows": len(base), "dimension": dimension,
+          +                  "query_count": len(queries), "ddl_and_first_query_seconds": time.perf_counter() - start}
+          +        for k in (10, 100):
+          +            latency, recall = [], []
+          +            for i in range(len(queries)):
+          +                start = time.perf_counter()
+          +                ids = query(i, k)
+          +                latency.append((time.perf_counter() - start) * 1000)
+          +                assert len(ids) == k and len(set(ids)) == k
+          +                recall.append(len(set(ids) & set(map(int, exact[i][:k]))) / k)
+          +            report[f"recall_at_{k}"] = float(np.mean(recall))
+          +            report[f"p50_sql_query_ms_at_{k}"] = float(np.median(latency))
+          +        reports.append(report)
+          +        print(json.dumps(report, sort_keys=True), flush=True)
+          +        # Remove the completed index before switching bridge libraries. Keep
+          +        # imported rows, so the next measurement uses the identical SQL data.
+          +        cursor.execute(f"DROP INDEX idx_cagra ON {table}")
+          +connection.close()
+          +if reports:
+          +    (args.root / f"sql-{args.label}.json").write_text(json.dumps(reports, indent=2) + "\n")
+          diff --git a/benchmarks/test_gpu_worker.c b/benchmarks/test_gpu_worker.c
+          new file mode 100644
+          index 0000000..fab022f
+          --- /dev/null
+          +++ b/benchmarks/test_gpu_worker.c
+          @@ -0,0 +1,46 @@
+          +/* Copyright (c) 2026 OceanBase.
+          + * Licensed under the Apache License, Version 2.0. */
+          +#include "gpu_worker.h"
+          +#include <assert.h>
+          +#include <pthread.h>
+          +#include <stdint.h>
+          +
+          +typedef struct {
+          +  int input, output;
+          +  pthread_t executed_by;
+          +} result;
+          +
+          +static void calculate(void *argument)
+          +{
+          +  result *value = (result*)argument;
+          +  value->output = value->input * 7;
+          +  value->executed_by = pthread_self();
+          +}
+          +
+          +static void nested(void *argument)
+          +{
+          +  assert(gpu_worker_run(calculate, argument) == 0);
+          +}
+          +
+          +static void *caller(void *argument)
+          +{
+          +  intptr_t number = (intptr_t)argument;
+          +  pthread_t previous;
+          +  for (int i = 0; i < 200; ++i) {
+          +    result value = {(int)(number * 200 + i), -1, pthread_self()};
+          +    assert(gpu_worker_run(i % 2 == 0 ? calculate : nested, &value) == 0);
+          +    assert(value.output == value.input * 7);
+          +    assert(!pthread_equal(value.executed_by, pthread_self()));
+          +    if (i != 0) assert(pthread_equal(previous, value.executed_by));
+          +    previous = value.executed_by;
+          +  }
+          +  return NULL;
+          +}
+          +
+          +int main(void)
+          +{
+          +  pthread_t callers[8];
+          +  for (intptr_t i = 0; i < 8; ++i) assert(pthread_create(&callers[i], NULL, caller, (void*)i) == 0);
+          +  for (int i = 0; i < 8; ++i) assert(pthread_join(callers[i], NULL) == 0);
+          +  return 0;
+          +}
+          diff --git a/benchmarks/tune_bridge.py b/benchmarks/tune_bridge.py
+          new file mode 100644
+          index 0000000..d6f05f6
+          --- /dev/null
+          +++ b/benchmarks/tune_bridge.py
+          @@ -0,0 +1,62 @@
+          +"""Build isolated parameter variants and compare the real GPU bridge.
+          +
+          +Run in the assigned AMD development container. Each measurement gets its own
+          +process and output files; variants run consecutively to avoid GPU contention.
+          +"""
+          +
+          +import argparse
+          +import json
+          +import os
+          +from pathlib import Path
+          +import shutil
+          +import subprocess
+          +import sys
+          +
+          +
+          +def main():
+          +    parser = argparse.ArgumentParser(description=__doc__)
+          +    parser.add_argument("root", type=Path)
+          +    parser.add_argument("--data", type=Path, required=True)
+          +    parser.add_argument("--dimension", type=int, required=True)
+          +    args = parser.parse_args()
+          +    source = args.root / "candidate"
+          +    original = (source / "seekdb_cuvs_bridge.c").read_text()
+          +    variants = [
+          +        ("nn100-auto512", "NN_DESCENT", 128, 256, 100, 512),
+          +        ("nn32-g64-auto2048", "NN_DESCENT", 64, 128, 32, 2048),
+          +        ("nn32-g64-auto4096", "NN_DESCENT", 64, 128, 32, 4096),
+          +        ("ivfpq-g128-auto2048", "IVF_PQ", 128, 256, 100, 2048),
+          +        ("ivfpq-g64-auto2048", "IVF_PQ", 64, 128, 100, 2048),
+          +        ("ivfpq-g64-auto4096", "IVF_PQ", 64, 128, 100, 4096),
+          +    ]
+          +    for name, algorithm, degree, intermediate, iterations, candidates in variants:
+          +        target = args.root / name
+          +        target.mkdir(exist_ok=True)
+          +        for filename in ["build.sh", "seekdb_cuvs_bridge.h", "gpu_worker.c", "gpu_worker.h"]:
+          +            shutil.copy2(source / filename, target / filename)
+          +        text = original.replace("build_algo = NN_DESCENT", f"build_algo = {algorithm}")
+          +        text = text.replace("graph_degree = 128;", f"graph_degree = {degree};")
+          +        text = text.replace("intermediate_graph_degree = 256;", f"intermediate_graph_degree = {intermediate};")
+          +        text = text.replace("nn_descent_niter = 24;", f"nn_descent_niter = {iterations};")
+          +        text = text.replace("sp->algo = SINGLE_CTA;", "sp->algo = AUTO;")
+          +        text = text.replace("if (required_itopk < 512) required_itopk = 512;",
+          +                            f"if (required_itopk < {candidates}) required_itopk = {candidates};")
+          +        (target / "seekdb_cuvs_bridge.c").write_text(text)
+          +        library = target / "libseekdb_cuvs_bridge.so"
+          +        build = subprocess.run(["bash", str(target / "build.sh"), str(library)], capture_output=True, text=True)
+          +        (target / "compile.log").write_text(build.stdout + build.stderr)
+          +        print(json.dumps({"variant": name, "compile_exit": build.returncode}), flush=True)
+          +        if build.returncode:
+          +            continue
+          +        result = subprocess.run([
+          +            sys.executable, str(args.root / "cagra_bridge.py"), str(library),
+          +            "--data", str(args.data), "--dimension", str(args.dimension), "--transient-threads",
+          +        ], capture_output=True, text=True, env=os.environ.copy())
+          +        (target / "benchmark.json").write_text(result.stdout)
+          +        (target / "benchmark.stderr").write_text(result.stderr)
+          +        print(json.dumps({"variant": name, "exit": result.returncode,
+          +                          "output": result.stdout, "error": result.stderr[-2000:]}), flush=True)
+          +
+          +
+          +if __name__ == "__main__":
+          +    main()
+          diff --git a/benchmarks/tune_precision.py b/benchmarks/tune_precision.py
+          new file mode 100644
+          index 0000000..09a072a
+          --- /dev/null
+          +++ b/benchmarks/tune_precision.py
+          @@ -0,0 +1,75 @@
+          +"""Compare graph builders and FP32 IVF-PQ distances on both development corpora."""
+          +
+          +import json
+          +import os
+          +from pathlib import Path
+          +import shutil
+          +import subprocess
+          +import sys
+          +
+          +
+          +root = Path(sys.argv[1])
+          +reference = root / "ivfpq-g64-auto4096"
+          +original = (reference / "seekdb_cuvs_bridge.c").read_text()
+          +variants = [("ivfpq-f32-r2", 2, 4096), ("ivfpq-f32-r4", 4, 4096),
+          +            ("nn32-g32-4096", 0, 4096), ("nn32-g32-8192", 0, 8192)]
+          +if len(sys.argv) > 2:
+          +    variants = [variant for variant in variants if variant[0].startswith(sys.argv[2])]
+          +
+          +for name, refinement, candidates in variants:
+          +    target = root / name
+          +    target.mkdir(exist_ok=True)
+          +    for filename in ["build.sh", "seekdb_cuvs_bridge.h", "gpu_worker.c", "gpu_worker.h"]:
+          +        shutil.copy2(reference / filename, target / filename)
+          +    text = original
+          +    if refinement:
+          +        text = text.replace("#include <cuvs/neighbors/cagra.h>",
+          +                            "#include <cuvs/neighbors/cagra.h>\n#include <cuvs/neighbors/ivf_pq.h>")
+          +        before = "  if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;"
+          +        after = """  cuvsIvfPqIndexParams_t pq_build = NULL;
+          +  cuvsIvfPqSearchParams_t pq_search = NULL;
+          +  struct cuvsIvfPqParams graph_params = {0};
+          +  if (cuvsIvfPqIndexParamsCreate(&pq_build) != CUVS_SUCCESS) goto fail_idx;
+          +  if (cuvsIvfPqSearchParamsCreate(&pq_search) != CUVS_SUCCESS) {
+          +    cuvsIvfPqIndexParamsDestroy(pq_build); goto fail_idx;
+          +  }
+          +  pq_build->n_lists = (uint32_t)((n + 1023) / 1024);
+          +  pq_search->n_probes = pq_build->n_lists < 32 ? pq_build->n_lists : 32;
+          +  pq_search->lut_dtype = HIP_R_32F;
+          +  pq_search->internal_distance_dtype = HIP_R_32F;
+          +  pq_search->coarse_search_dtype = HIP_R_32F;
+          +  graph_params.ivf_pq_build_params = pq_build;
+          +  graph_params.ivf_pq_search_params = pq_search;
+          +  graph_params.refinement_rate = REFINEMENT;
+          +  h->ip->graph_build_params = &graph_params;
+          +  cuvsError_t build_status = cuvsCagraBuild(h->res, h->ip, &dset, h->idx);
+          +  h->ip->graph_build_params = NULL;
+          +  cuvsIvfPqSearchParamsDestroy(pq_search);
+          +  cuvsIvfPqIndexParamsDestroy(pq_build);
+          +  if (build_status != CUVS_SUCCESS) goto fail_idx;""".replace("REFINEMENT", str(refinement) + ".0f")
+          +        assert text.count(before) == 1
+          +        text = text.replace(before, after)
+          +    else:
+          +        text = text.replace("build_algo = IVF_PQ", "build_algo = NN_DESCENT")
+          +        text = text.replace("h->ip->graph_degree = 64;", "h->ip->graph_degree = 32;")
+          +        text = text.replace("h->ip->intermediate_graph_degree = 128;", "h->ip->intermediate_graph_degree = 64;")
+          +        text = text.replace("nn_descent_niter = 100;", "nn_descent_niter = 32;")
+          +        text = text.replace("if (required_itopk < 4096) required_itopk = 4096;",
+          +                            f"if (required_itopk < {candidates}) required_itopk = {candidates};")
+          +    (target / "seekdb_cuvs_bridge.c").write_text(text)
+          +    library = target / "libseekdb_cuvs_bridge.so"
+          +    build = subprocess.run(["bash", str(target / "build.sh"), str(library)], capture_output=True, text=True)
+          +    (target / "compile.log").write_text(build.stdout + build.stderr)
+          +    print(json.dumps({"variant": name, "compile_exit": build.returncode,
+          +                      "error": build.stderr[-2000:]}), flush=True)
+          +    if build.returncode:
+          +        continue
+          +    for dataset, dimension in [("sift250k", 128), ("synthetic250k-d256", 256)]:
+          +        result = subprocess.run([
+          +            sys.executable, str(root / "cagra_bridge.py"), str(library),
+          +            "--data", str(root / dataset), "--dimension", str(dimension), "--transient-threads",
+          +        ], capture_output=True, text=True, env=os.environ.copy())
+          +        (target / (dataset + ".json")).write_text(result.stdout)
+          +        (target / (dataset + ".stderr")).write_text(result.stderr)
+          +        print(json.dumps({"variant": name, "dataset": dataset, "exit": result.returncode,
+          +                          "output": result.stdout, "error": result.stderr[-2000:]}), flush=True)
+          diff --git a/benchmarks/tune_rescale.py b/benchmarks/tune_rescale.py
+          new file mode 100644
+          index 0000000..f28ac4e
+          --- /dev/null
+          +++ b/benchmarks/tune_rescale.py
+          @@ -0,0 +1,87 @@
+          +"""Build a graph after uniform rescaling, then retain original FP32 search data.
+          +
+          +A uniform scale preserves Euclidean neighbour order. Keeping original vectors
+          +in the final CAGRA index also preserves query distances and snapshot format.
+          +"""
+          +
+          +from pathlib import Path
+          +import json
+          +import os
+          +import shutil
+          +import subprocess
+          +import sys
+          +
+          +
+          +root = Path(sys.argv[1])
+          +reference = root / "ivfpq-g64-auto4096"
+          +target = root / "ivfpq-rescale"
+          +target.mkdir(exist_ok=True)
+          +for filename in ["build.sh", "seekdb_cuvs_bridge.h", "gpu_worker.c", "gpu_worker.h"]:
+          +    shutil.copy2(reference / filename, target / filename)
+          +text = (reference / "seekdb_cuvs_bridge.c").read_text()
+          +text = text.replace("#include <stdio.h>", "#include <stdio.h>\n#include <math.h>")
+          +before = "  DLManagedTensor dset; long ds[2] = {n, dim};"
+          +after = """  float *scaled = NULL;
+          +  float maximum = 1.0f;
+          +  const size_t elements = (size_t)n * dim;
+          +  for (size_t i = 0; i < elements; ++i) {
+          +    const float value = fabsf(base[i]);
+          +    if (value > maximum) maximum = value;
+          +  }
+          +  if (maximum > 1.0f) {
+          +    int exponent = 0;
+          +    frexpf(maximum, &exponent);
+          +    const float scale = ldexpf(1.0f, -exponent);
+          +    scaled = (float*)malloc(elements * sizeof(float));
+          +    if (!scaled) goto fail_res;
+          +    for (size_t i = 0; i < elements; ++i) scaled[i] = base[i] * scale;
+          +  }
+          +  DLManagedTensor dset; long ds[2] = {n, dim};"""
+          +assert text.count(before) == 1
+          +text = text.replace(before, after).replace("dset.dl_tensor.data = (void*)base;",
+          +                                          "dset.dl_tensor.data = (void*)(scaled ? scaled : base);")
+          +before = "  h->n = n; h->dim = dim;"
+          +after = """  if (scaled) {
+          +    DLManagedTensor dataset = {0};
+          +    if (cuvsCagraIndexGetDataset(h->idx, &dataset) != CUVS_SUCCESS) goto fail_idx;
+          +    cudaStream_t stream = 0;
+          +    int failed = cuvsStreamGet(h->res, &stream) != CUVS_SUCCESS;
+          +    const size_t row_bytes = (size_t)dim * sizeof(float);
+          +    const int64_t row_stride = dataset.dl_tensor.strides ? dataset.dl_tensor.strides[0] : dim;
+          +    char *device = (char*)dataset.dl_tensor.data + dataset.dl_tensor.byte_offset;
+          +    if (!failed && row_stride == dim) {
+          +      failed = cudaMemcpyAsync(device, base, elements * sizeof(float),
+          +                               cudaMemcpyHostToDevice, stream) != cudaSuccess;
+          +    } else if (!failed) {
+          +      for (long row = 0; row < n && !failed; ++row) {
+          +        failed = cudaMemcpyAsync(device + row * row_stride * sizeof(float),
+          +                                 base + row * dim, row_bytes,
+          +                                 cudaMemcpyHostToDevice, stream) != cudaSuccess;
+          +      }
+          +    }
+          +    if (cuvsStreamSync(h->res) != CUVS_SUCCESS) failed = 1;
+          +    if (dataset.deleter) dataset.deleter(&dataset);
+          +    if (failed) goto fail_idx;
+          +  }
+          +  free(scaled); scaled = NULL;
+          +  h->n = n; h->dim = dim;"""
+          +assert text.count(before) == 1
+          +text = text.replace(before, after)
+          +text = text.replace("fail_res: cuvsResourcesDestroy(h->res);",
+          +                    "fail_res: free(scaled); cuvsResourcesDestroy(h->res);")
+          +(target / "seekdb_cuvs_bridge.c").write_text(text)
+          +library = target / "libseekdb_cuvs_bridge.so"
+          +build = subprocess.run(["bash", str(target / "build.sh"), str(library)], capture_output=True, text=True)
+          +(target / "compile.log").write_text(build.stdout + build.stderr)
+          +print("compile", build.returncode, build.stdout, build.stderr, flush=True)
+          +if build.returncode:
+          +    raise SystemExit(build.returncode)
+          +for dataset, dimension in [("sift250k", 128), ("synthetic250k-d256", 256)]:
+          +    result = subprocess.run([
+          +        sys.executable, str(root / "cagra_bridge.py"), str(library),
+          +        "--data", str(root / dataset), "--dimension", str(dimension), "--transient-threads",
+          +    ], capture_output=True, text=True, env=os.environ.copy())
+          +    (target / (dataset + ".json")).write_text(result.stdout)
+          +    (target / (dataset + ".stderr")).write_text(result.stderr)
+          +    print(json.dumps({"dataset": dataset, "exit": result.returncode,
+          +                      "output": result.stdout, "error": result.stderr[-2500:]}), flush=True)
+          diff --git a/tools/hipvs_bridge/build.sh b/tools/hipvs_bridge/build.sh
+          index d0a3b62..bcd56ec 100755
+          --- a/tools/hipvs_bridge/build.sh
+          +++ b/tools/hipvs_bridge/build.sh
+          @@ -23,11 +23,13 @@ mkdir -p "$(dirname "$OUTPUT")"
+           "$HIPCC" \
+             -shared \
+             -fPIC \
+          +  -pthread \
+             -O2 \
+             -D__HIP_PLATFORM_AMD__ \
+             -I"$HIPVS_ROOT/include" \
+             -I"$ROCM_ROOT/include" \
+             "$SCRIPT_DIR/seekdb_cuvs_bridge.c" \
+          +  "$SCRIPT_DIR/gpu_worker.c" \
+             -L"$HIPVS_ROOT/lib" \
+             -Wl,-soname,libseekdb_cuvs_bridge.so \
+             -Wl,-rpath,"$HIPVS_ROOT/lib:$ROCM_ROOT/lib" \
+          diff --git a/tools/hipvs_bridge/gpu_worker.c b/tools/hipvs_bridge/gpu_worker.c
+          new file mode 100644
+          index 0000000..3103503
+          --- /dev/null
+          +++ b/tools/hipvs_bridge/gpu_worker.c
+          @@ -0,0 +1,103 @@
+          +/* Copyright (c) 2026 OceanBase.
+          + * Licensed under the Apache License, Version 2.0. */
+          +#include "gpu_worker.h"
+          +#include <errno.h>
+          +#include <pthread.h>
+          +#include <stdlib.h>
+          +
+          +typedef struct work_item {
+          +  void (*function)(void *);
+          +  void *argument;
+          +  struct work_item *next;
+          +  pthread_cond_t completed;
+          +  int done;
+          +} work_item;
+          +
+          +static pthread_once_t initialized = PTHREAD_ONCE_INIT;
+          +static pthread_once_t exit_registered = PTHREAD_ONCE_INIT;
+          +static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+          +static pthread_cond_t available = PTHREAD_COND_INITIALIZER;
+          +static pthread_t worker;
+          +static work_item *head = NULL, *tail = NULL;
+          +static int startup_error = EAGAIN;
+          +static int stopping = 0;
+          +
+          +static void stop_worker(void);
+          +
+          +static void register_exit(void)
+          +{
+          +  /* Register after the first callback: GPU libraries initialize lazy globals
+          +   * there. Join this thread before their process-exit destructors release them. */
+          +  atexit(stop_worker);
+          +}
+          +
+          +static void *worker_loop(void *unused)
+          +{
+          +  (void)unused;
+          +  pthread_mutex_lock(&mutex);
+          +  for (;;) {
+          +    while (head == NULL && !stopping) pthread_cond_wait(&available, &mutex);
+          +    if (head == NULL && stopping) break;
+          +    work_item *item = head;
+          +    head = item->next;
+          +    if (head == NULL) tail = NULL;
+          +    pthread_mutex_unlock(&mutex);
+          +    item->function(item->argument);
+          +    pthread_once(&exit_registered, register_exit);
+          +    pthread_mutex_lock(&mutex);
+          +    item->done = 1;
+          +    pthread_cond_signal(&item->completed);
+          +  }
+          +  pthread_mutex_unlock(&mutex);
+          +  return NULL;
+          +}
+          +
+          +static void start_worker(void)
+          +{
+          +  pthread_attr_t attributes;
+          +  startup_error = pthread_attr_init(&attributes);
+          +  if (startup_error != 0) return;
+          +  startup_error = pthread_attr_setstacksize(&attributes, 32UL * 1024 * 1024);
+          +  if (startup_error == 0) startup_error = pthread_create(&worker, &attributes, worker_loop, NULL);
+          +  pthread_attr_destroy(&attributes);
+          +}
+          +
+          +int gpu_worker_run(void (*function)(void *), void *argument)
+          +{
+          +  pthread_once(&initialized, start_worker);
+          +  if (startup_error != 0) return startup_error;
+          +  if (pthread_equal(pthread_self(), worker)) {
+          +    function(argument);
+          +    return 0;
+          +  }
+          +  work_item item = {function, argument, NULL, PTHREAD_COND_INITIALIZER, 0};
+          +  pthread_mutex_lock(&mutex);
+          +  if (stopping) {
+          +    pthread_mutex_unlock(&mutex);
+          +    pthread_cond_destroy(&item.completed);
+          +    return ESHUTDOWN;
+          +  }
+          +  if (tail == NULL) head = &item;
+          +  else tail->next = &item;
+          +  tail = &item;
+          +  pthread_cond_signal(&available);
+          +  while (!item.done) pthread_cond_wait(&item.completed, &mutex);
+          +  pthread_mutex_unlock(&mutex);
+          +  pthread_cond_destroy(&item.completed);
+          +  return 0;
+          +}
+          +
+          +/* dlclose must not leave a thread executing instructions from this library. */
+          +__attribute__((destructor)) static void stop_worker(void)
+          +{
+          +  if (startup_error != 0) return;
+          +  pthread_mutex_lock(&mutex);
+          +  if (stopping) {
+          +    pthread_mutex_unlock(&mutex);
+          +    return;
+          +  }
+          +  stopping = 1;
+          +  pthread_cond_signal(&available);
+          +  pthread_mutex_unlock(&mutex);
+          +  pthread_join(worker, NULL);
+          +}
+          diff --git a/tools/hipvs_bridge/gpu_worker.h b/tools/hipvs_bridge/gpu_worker.h
+          new file mode 100644
+          index 0000000..1aa8d9f
+          --- /dev/null
+          +++ b/tools/hipvs_bridge/gpu_worker.h
+          @@ -0,0 +1,7 @@
+          +/* Copyright (c) 2026 OceanBase.
+          + * Licensed under the Apache License, Version 2.0. */
+          +#pragma once
+          +
+          +/* Execute synchronously on one persistent 32 MiB-stack worker. The callback
+          + * finishes before return, so callers may pass stack-owned inputs and outputs. */
+          +int gpu_worker_run(void (*function)(void *), void *argument);
+          diff --git a/tools/hipvs_bridge/seekdb_cuvs_bridge.c b/tools/hipvs_bridge/seekdb_cuvs_bridge.c
+          index 88694f3..daa3d35 100644
+          --- a/tools/hipvs_bridge/seekdb_cuvs_bridge.c
+          +++ b/tools/hipvs_bridge/seekdb_cuvs_bridge.c
+          @@ -1,5 +1,6 @@
+           /* seekdb <-> hipVS bridge: plain-C CAGRA kNN; all cuVS/ROCm deps live here. */
+           #include "seekdb_cuvs_bridge.h"
+          +#include "gpu_worker.h"
+           #include <cuvs/core/c_api.h>
+           #include <cuvs/neighbors/cagra.h>
+           #include <dlpack/dlpack.h>
+          @@ -9,56 +10,149 @@
+           #include <cuda_runtime.h>
+           #endif
+           #include <stdio.h>
+          +#include <math.h>
+           #include <stdlib.h>
+          +#include <pthread.h>
+          +#include <string.h>
+           
+           typedef struct {
+             cuvsResources_t        res;
+             cuvsCagraIndexParams_t ip;
+             cuvsCagraIndex_t       idx;
+          +  cuvsCagraSearchParams_t search_params;
+          +  pthread_mutex_t search_mutex;
+          +  void *query_buffer, *neighbor_buffer, *distance_buffer;
+          +  size_t query_capacity, neighbor_capacity, distance_capacity;
+          +  void *host_buffer;
+          +  size_t host_capacity;
+             long n, dim;
+           } sk_cuvs_index;
+           
+          +/* Grow scratch space on demand. Index-owned buffers avoid three device
+          + * allocations and frees for every single-row SQL search. */
+          +static int reserve_buffer(sk_cuvs_index *h, void **buffer, size_t *capacity, size_t bytes)
+          +{
+          +  if (bytes <= *capacity) return 0;
+          +  void *replacement = NULL;
+          +  if (cuvsRMMAlloc(h->res, &replacement, bytes) != CUVS_SUCCESS) return 1;
+          +  if (*buffer) cuvsRMMFree(h->res, *buffer, *capacity);
+          +  *buffer = replacement;
+          +  *capacity = bytes;
+          +  return 0;
+          +}
+          +
+           void* seekdb_cuvs_build(const float* base, long n, long dim)
+           {
+             sk_cuvs_index* h = (sk_cuvs_index*)calloc(1, sizeof(*h));
+             if (!h) return NULL;
+          -  if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { free(h); return NULL; }
+          +  if (pthread_mutex_init(&h->search_mutex, NULL) != 0) { free(h); return NULL; }
+          +  if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) {
+          +    pthread_mutex_destroy(&h->search_mutex); free(h); return NULL;
+          +  }
+          +
+          +  /* IVF-PQ's internal low-precision arithmetic loses neighbours on large
+          +   * descriptor values. A power-of-two scale preserves L2 neighbour order
+          +   * without introducing rounding in normal FP32 values. Only graph training
+          +   * uses the scaled copy; search and snapshots retain the original data. */
+          +  float *scaled = NULL;
+          +  float maximum = 1.0f;
+          +  const size_t elements = (size_t)n * dim;
+          +  for (size_t i = 0; i < elements; ++i) {
+          +    const float value = fabsf(base[i]);
+          +    if (value > maximum) maximum = value;
+          +  }
+          +  if (maximum > 1.0f) {
+          +    int exponent = 0;
+          +    frexpf(maximum, &exponent);
+          +    const float scale = ldexpf(1.0f, -exponent);
+          +    scaled = (float*)malloc(elements * sizeof(float));
+          +    if (!scaled) goto fail_res;
+          +    for (size_t i = 0; i < elements; ++i) scaled[i] = base[i] * scale;
+          +  }
+           
+             DLManagedTensor dset; long ds[2] = {n, dim};
+          -  dset.dl_tensor.data = (void*)base;
+          +  dset.dl_tensor.data = (void*)(scaled ? scaled : base);
+             dset.dl_tensor.device.device_type = kDLCPU; dset.dl_tensor.device.device_id = 0;
+             dset.dl_tensor.ndim = 2;
+             dset.dl_tensor.dtype.code = kDLFloat; dset.dl_tensor.dtype.bits = 32; dset.dl_tensor.dtype.lanes = 1;
+             dset.dl_tensor.shape = ds; dset.dl_tensor.strides = 0; dset.dl_tensor.byte_offset = 0;
+           
+             if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
+          -  h->ip->build_algo = NN_DESCENT;
+          -  h->ip->graph_degree = 128;
+          -  h->ip->intermediate_graph_degree = 256;
+          +  h->ip->build_algo = IVF_PQ;
+          +  h->ip->graph_degree = 64;
+          +  h->ip->intermediate_graph_degree = 128;
+             h->ip->nn_descent_niter = 100;
+             if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
+             if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
+          +  if (scaled) {
+          +    DLManagedTensor dataset = {0};
+          +    if (cuvsCagraIndexGetDataset(h->idx, &dataset) != CUVS_SUCCESS) goto fail_idx;
+          +    cudaStream_t stream = 0;
+          +    int failed = cuvsStreamGet(h->res, &stream) != CUVS_SUCCESS;
+          +    const size_t row_bytes = (size_t)dim * sizeof(float);
+          +    const int64_t row_stride = dataset.dl_tensor.strides ? dataset.dl_tensor.strides[0] : dim;
+          +    char *device = (char*)dataset.dl_tensor.data + dataset.dl_tensor.byte_offset;
+          +    if (!failed && row_stride == dim) {
+          +      failed = cudaMemcpyAsync(device, base, elements * sizeof(float),
+          +                               cudaMemcpyHostToDevice, stream) != cudaSuccess;
+          +    } else if (!failed) {
+          +      for (long row = 0; row < n && !failed; ++row) {
+          +        failed = cudaMemcpyAsync(device + row * row_stride * sizeof(float),
+          +                                 base + row * dim, row_bytes,
+          +                                 cudaMemcpyHostToDevice, stream) != cudaSuccess;
+          +      }
+          +    }
+          +    if (cuvsStreamSync(h->res) != CUVS_SUCCESS) failed = 1;
+          +    if (dataset.deleter) dataset.deleter(&dataset);
+          +    if (failed) goto fail_idx;
+          +  }
+          +  free(scaled); scaled = NULL;
+             h->n = n; h->dim = dim;
+             return h;
+           
+          -fail_idx: cuvsCagraIndexDestroy(h->idx);
+          +fail_idx: cuvsStreamSync(h->res); cuvsCagraIndexDestroy(h->idx);
+           fail_ip:  cuvsCagraIndexParamsDestroy(h->ip);
+          -fail_res: cuvsResourcesDestroy(h->res); free(h);
+          +fail_res: cuvsStreamSync(h->res); free(scaled); cuvsResourcesDestroy(h->res);
+          +  pthread_mutex_destroy(&h->search_mutex); free(h);
+             fprintf(stderr, "[seekdb_cuvs] build failed: %s\n", cuvsGetLastErrorText());
+             return NULL;
+           }
+           
+          -int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
+          +static int search_on_worker(void* handle, const float* query, long nq, long topk,
+                                  unsigned int* out_ids, float* out_dist)
+           {
+             sk_cuvs_index* h = (sk_cuvs_index*)handle;
+          -  if (!h) return 1;
+          +  if (!h || !query || !out_ids || nq <= 0 || topk <= 0 || topk > h->n) return 1;
+             int rc = 0;
+             float* qd = 0; unsigned* nd = 0; float* dd = 0; cuvsCagraSearchParams_t sp = 0;
+          -  if (cuvsRMMAlloc(h->res, (void**)&qd, sizeof(float)*nq*h->dim)  != CUVS_SUCCESS) { rc=10; goto done; }
+          -  if (cuvsRMMAlloc(h->res, (void**)&nd, sizeof(unsigned)*nq*topk) != CUVS_SUCCESS) { rc=11; goto done; }
+          -  if (cuvsRMMAlloc(h->res, (void**)&dd, sizeof(float)*nq*topk)    != CUVS_SUCCESS) { rc=12; goto done; }
+          -  if (cudaMemcpy(qd, query, sizeof(float)*nq*h->dim, cudaMemcpyDefault) != cudaSuccess) { rc=13; goto done; }
+          +  const size_t query_bytes = sizeof(float)*nq*h->dim;
+          +  const size_t result_bytes = sizeof(unsigned)*nq*topk;
+          +  const size_t host_bytes = query_bytes + result_bytes + sizeof(float)*nq*topk;
+          +  void *replacement = NULL;
+          +  char *host_query = NULL, *host_ids = NULL, *host_distances = NULL;
+          +  cudaStream_t stream = 0;
+          +  int stream_ready = 0;
+          +  pthread_mutex_lock(&h->search_mutex);
+          +  if (reserve_buffer(h, &h->query_buffer, &h->query_capacity, sizeof(float)*nq*h->dim)) { rc=10; goto done; }
+          +  if (reserve_buffer(h, &h->neighbor_buffer, &h->neighbor_capacity, sizeof(unsigned)*nq*topk)) { rc=11; goto done; }
+          +  if (reserve_buffer(h, &h->distance_buffer, &h->distance_capacity, sizeof(float)*nq*topk)) { rc=12; goto done; }
+          +  qd = (float*)h->query_buffer; nd = (unsigned*)h->neighbor_buffer; dd = (float*)h->distance_buffer;
+          +  if (host_bytes > h->host_capacity) {
+          +#ifdef __HIP_PLATFORM_AMD__
+          +    if (cudaMallocHost(&replacement, host_bytes, 0) != cudaSuccess) { rc=17; goto done; }
+          +#else
+          +    if (cudaMallocHost(&replacement, host_bytes) != cudaSuccess) { rc=17; goto done; }
+          +#endif
+          +    if (h->host_buffer) cudaFreeHost(h->host_buffer);
+          +    h->host_buffer = replacement; h->host_capacity = host_bytes;
+          +  }
+          +  host_query = (char*)h->host_buffer;
+          +  host_ids = host_query + query_bytes;
+          +  host_distances = host_ids + result_bytes;
+          +  memcpy(host_query, query, query_bytes);
+          +  if (cuvsStreamGet(h->res, &stream) != CUVS_SUCCESS) { rc=18; goto done; }
+          +  stream_ready = 1;
+          +  if (cudaMemcpyAsync(qd, host_query, query_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) { rc=13; goto done; }
+             {
+               DLManagedTensor qt, nt, dt; long qs[2]={nq,h->dim}, nsh[2]={nq,topk}, dsh[2]={nq,topk};
+               qt.dl_tensor.data=qd; qt.dl_tensor.device.device_type=kDLCUDA; qt.dl_tensor.device.device_id=0;
+          @@ -66,34 +160,72 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
+               qt.dl_tensor.shape=qs; qt.dl_tensor.strides=0; qt.dl_tensor.byte_offset=0;
+               nt=qt; nt.dl_tensor.data=nd; nt.dl_tensor.dtype.code=kDLUInt; nt.dl_tensor.shape=nsh;
+               dt=qt; dt.dl_tensor.data=dd; dt.dl_tensor.dtype.code=kDLFloat; dt.dl_tensor.shape=dsh;
+          -    if (cuvsCagraSearchParamsCreate(&sp) != CUVS_SUCCESS) { rc=14; goto done; }
+          +    if (!h->search_params && cuvsCagraSearchParamsCreate(&h->search_params) != CUVS_SUCCESS) { rc=14; goto done; }
+          +    sp = h->search_params;
+               {
+                 size_t required_itopk = (size_t)topk * 4;
+          -      if (required_itopk < 512) required_itopk = 512;
+          -      if (sp->itopk_size < required_itopk) sp->itopk_size = required_itopk;
+          +      if (required_itopk < 4096) required_itopk = 4096;
+          +      sp->itopk_size = required_itopk;
+                 sp->search_width = 4;
+          +      sp->algo = AUTO;
+               }
+               cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
+               if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
+          -    if (cudaMemcpy(out_ids, nd, sizeof(unsigned)*nq*topk, cudaMemcpyDefault) != cudaSuccess) { rc=16; goto done; }
+          -    if (out_dist) cudaMemcpy(out_dist, dd, sizeof(float)*nq*topk, cudaMemcpyDefault);
+          +    if (cudaMemcpyAsync(host_ids, nd, result_bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) { rc=16; goto done; }
+          +    if (out_dist && cudaMemcpyAsync(host_distances, dd, sizeof(float)*nq*topk, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+          +      rc=16; goto done;
+          +    }
+             }
+           done:
+          -  if (sp) cuvsCagraSearchParamsDestroy(sp);
+          -  if (dd) cuvsRMMFree(h->res, dd, sizeof(float)*nq*topk);
+          -  if (nd) cuvsRMMFree(h->res, nd, sizeof(unsigned)*nq*topk);
+          -  if (qd) cuvsRMMFree(h->res, qd, sizeof(float)*nq*h->dim);
+          +  /* One stream barrier covers H2D, search, and D2H. It also makes scratch reuse
+          +   * safe after an intermediate failure; all caller outputs remain synchronous. */
+          +  if (stream_ready && cuvsStreamSync(h->res) != CUVS_SUCCESS && rc == 0) rc=19;
+          +  if (rc == 0) {
+          +    memcpy(out_ids, host_ids, result_bytes);
+          +    if (out_dist) memcpy(out_dist, host_distances, sizeof(float)*nq*topk);
+          +  }
+          +  pthread_mutex_unlock(&h->search_mutex);
+             if (rc) fprintf(stderr, "[seekdb_cuvs] search rc=%d: %s\n", rc, cuvsGetLastErrorText());
+             return rc;
+           }
+           
+          +typedef struct {
+          +  void *handle;
+          +  const float *query;
+          +  long nq, topk;
+          +  unsigned int *ids;
+          +  float *distances;
+          +  int result;
+          +} search_work;
+          +
+          +static void run_search(void *argument)
+          +{
+          +  search_work *work = (search_work*)argument;
+          +  work->result = search_on_worker(work->handle, work->query, work->nq,
+          +                                 work->topk, work->ids, work->distances);
+          +}
+          +
+          +int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
+          +                       unsigned int* out_ids, float* out_dist)
+          +{
+          +  search_work work = {handle, query, nq, topk, out_ids, out_dist, -1};
+          +  if (gpu_worker_run(run_search, &work) != 0) return -1;
+          +  return work.result;
+          +}
+          +
+           void seekdb_cuvs_free(void* handle)
+           {
+             sk_cuvs_index* h = (sk_cuvs_index*)handle;
+             if (!h) return;
+          +  if (h->query_buffer) cuvsRMMFree(h->res, h->query_buffer, h->query_capacity);
+          +  if (h->neighbor_buffer) cuvsRMMFree(h->res, h->neighbor_buffer, h->neighbor_capacity);
+          +  if (h->distance_buffer) cuvsRMMFree(h->res, h->distance_buffer, h->distance_capacity);
+          +  if (h->host_buffer) cudaFreeHost(h->host_buffer);
+          +  if (h->search_params) cuvsCagraSearchParamsDestroy(h->search_params);
+             cuvsCagraIndexDestroy(h->idx);
+             cuvsCagraIndexParamsDestroy(h->ip);
+             cuvsResourcesDestroy(h->res);
+          +  pthread_mutex_destroy(&h->search_mutex);
+             free(h);
+           }
+           
+          @@ -113,6 +245,7 @@ void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
+             if (!filename || n <= 0 || dim <= 0) return NULL;
+             sk_cuvs_index* index = (sk_cuvs_index*)calloc(1, sizeof(*index));
+             if (!index) return NULL;
+          +  if (pthread_mutex_init(&index->search_mutex, NULL) != 0) { free(index); return NULL; }
+             if (cuvsResourcesCreate(&index->res) != CUVS_SUCCESS) goto fail;
+             if (cuvsCagraIndexParamsCreate(&index->ip) != CUVS_SUCCESS) goto fail_res;
+             if (cuvsCagraIndexCreate(&index->idx) != CUVS_SUCCESS) goto fail_ip;
+          @@ -139,7 +272,7 @@ fail_res:
+             cuvsResourcesDestroy(index->res);
+           fail:
+             fprintf(stderr, "[seekdb_cuvs] deserialize failed: %s\n", cuvsGetLastErrorText());
+          -  free(index);
+          +  pthread_mutex_destroy(&index->search_mutex); free(index);
+             return NULL;
+           }
+           
+          AMD_V5_REVIEWED_PATCH
+          git apply --check ../reviewed.patch
+          git apply ../reviewed.patch
+          git diff --check
+          git config user.name 'lycegg+gpt'
+          git config user.email '821853076@qq.com'
+          git add tools/hipvs_bridge benchmarks
+          git -c commit.gpgsign=false commit -m 'Accelerate CAGRA with scaled graph training and persistent GPU query resources'
+      - name: Publish the answer branch without rewriting any existing branch
+        working-directory: answer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          askpass=$(mktemp)
+          trap 'rm -f "$askpass"' EXIT
+          cat > "$askpass" <<'GIT_ASKPASS_SCRIPT'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *) printf '%s\n' "$GH_TOKEN" ;;
+          esac
+          GIT_ASKPASS_SCRIPT
+          chmod 700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git -c credential.helper= push https://github.com/SakuraMarble/seekdb-haiku.git HEAD:refs/heads/codex/amd-cagra-v5
