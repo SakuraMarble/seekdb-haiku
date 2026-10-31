@@ -23,11 +23,13 @@ mkdir -p "$(dirname "$OUTPUT")"
 "$HIPCC" \
   -shared \
   -fPIC \
+  -pthread \
   -O2 \
   -D__HIP_PLATFORM_AMD__ \
   -I"$HIPVS_ROOT/include" \
   -I"$ROCM_ROOT/include" \
   "$SCRIPT_DIR/seekdb_cuvs_bridge.c" \
+  "$SCRIPT_DIR/gpu_worker.c" \
   -L"$HIPVS_ROOT/lib" \
   -Wl,-soname,libseekdb_cuvs_bridge.so \
   -Wl,-rpath,"$HIPVS_ROOT/lib:$ROCM_ROOT/lib" \
