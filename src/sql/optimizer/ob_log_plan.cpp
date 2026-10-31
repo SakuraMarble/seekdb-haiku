@@ -47,6 +47,7 @@
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/optimizer/ob_log_expand.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
+#include "sql/resolver/dml/ob_stmt_expr_visitor.h"
 #include "sql/optimizer/ob_log_insert.h"
 #include "sql/ob_sql_trans_control.h"
 
@@ -12046,6 +12047,39 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
     }
     if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
     } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.rowkey_idx_tid_ == OB_INVALID_ID))) {
+    }
+    if (OB_SUCC(ret) && get_stmt()->is_select_stmt()
+        && match_pred->get_expr_type() == T_OP_BOOL
+        && match_pred->get_param_count() == 1
+        && match_pred->get_param_expr(0) == match_against
+        && match_against->get_mode_flag() == NATURAL_LANGUAGE_MODE
+        && match_against->get_columns_boosts().empty()
+        && nullptr == match_against->get_param_text_expr()
+        && !table_scan->is_vec_idx_scan() && !table_scan->is_vec_adaptive_scan()) {
+      ObSEArray<ObRawExpr *, 16> other_exprs;
+      ObStmtExprGetter visitor;
+      visitor.set_relation_scope();
+      visitor.remove_scope(SCOPE_WHERE);
+      bool score_used = false;
+      if (OB_FAIL(get_stmt()->get_relation_exprs(other_exprs, visitor))) {
+      } else {
+        // Check non-WHERE consumers separately: a projected expression can be
+        // shared with the predicate and still require its real numeric score.
+        score_used = ObOptimizerUtil::is_sub_expr(match_against, other_exprs);
+        const auto &conditions = get_stmt()->get_condition_exprs();
+        for (int64_t i = 0; !score_used && i < conditions.count(); ++i) {
+          if (conditions.at(i) != match_pred) {
+            score_used = ObOptimizerUtil::is_sub_expr(match_against, conditions.at(i));
+          }
+        }
+        if (!score_used) {
+          // Natural-language postings already prove this Boolean predicate.
+          // BM25 floors IDF to a positive epsilon, so a real posting has a
+          // nonzero score. Keep ranked/threshold/Boolean-mode queries intact.
+          tr_info.need_calc_relevance_ = false;
+          tr_info.pushdown_match_filter_ = nullptr;
+        }
+      }
     }
   }
 

@@ -28,6 +28,22 @@ namespace oceanbase
 {
 namespace storage
 {
+struct ObFTDictHub::SharedIKDictionary
+{
+  explicit SharedIKDictionary(const ObFTDictDesc &desc)
+      : allocator_(lib::ObMemAttr("FTDictShared")),
+        ranges_(allocator_), dictionary_(allocator_, &ranges_, desc) {}
+
+  ObArenaAllocator allocator_;
+  ObFTCacheRangeContainer ranges_;
+  ObFTRangeDict dictionary_;
+};
+
+ObFTDictHub::~ObFTDictHub()
+{
+  destroy();
+}
+
 int ObFTDictHub::init()
 {
   static constexpr int K_MAX_DICT_BUCKET = 128; // for now, only built-in dicts.
@@ -43,7 +59,55 @@ int ObFTDictHub::init()
 int ObFTDictHub::destroy()
 {
   int ret = OB_SUCCESS;
+  auto *main = main_dictionary_.exchange(nullptr, std::memory_order_acq_rel);
+  auto *quantifier = quantifier_dictionary_.exchange(nullptr, std::memory_order_acq_rel);
+  OB_DELETE(SharedIKDictionary, "FTDictShared", main);
+  OB_DELETE(SharedIKDictionary, "FTDictShared", quantifier);
   is_inited_ = false;
+  return ret;
+}
+
+int ObFTDictHub::get_builtin_ik_dictionary(ObFTDictType type, const ObIFTDict *&dictionary)
+{
+  int ret = OB_SUCCESS;
+  dictionary = nullptr;
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+  } else if (type != ObFTDictType::DICT_IK_MAIN && type != ObFTDictType::DICT_IK_QUAN) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    auto &slot = type == ObFTDictType::DICT_IK_MAIN ? main_dictionary_ : quantifier_dictionary_;
+    SharedIKDictionary *view = slot.load(std::memory_order_acquire);
+    if (nullptr == view) {
+      lib::ObMutexGuard guard(shared_dictionary_mutex_);
+      view = slot.load(std::memory_order_relaxed);
+      if (nullptr == view) {
+        const ObFTDictDesc desc(type == ObFTDictType::DICT_IK_MAIN ? "main_dict" : "quan_dict",
+                               type, ObCharsetType::CHARSET_UTF8MB4, ObCollationType::CS_TYPE_UTF8MB4_BIN);
+        if (OB_ISNULL(view = OB_NEW(SharedIKDictionary, "FTDictShared", desc))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          if (OB_FAIL(load_cache(desc, view->ranges_)) && OB_ENTRY_NOT_EXIST == ret) {
+            ret = build_cache(desc, view->ranges_);
+          }
+          if (OB_SUCC(ret)) {
+            ret = view->dictionary_.init(true);
+          }
+          if (OB_SUCC(ret)) {
+            // No KV-cache handles survive publication. The owned snapshot
+            // stays valid through cache eviction and server shutdown ordering.
+            view->ranges_.reset();
+            slot.store(view, std::memory_order_release);
+          } else {
+            OB_DELETE(SharedIKDictionary, "FTDictShared", view);
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      dictionary = &view->dictionary_;
+    }
+  }
   return ret;
 }
 int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)

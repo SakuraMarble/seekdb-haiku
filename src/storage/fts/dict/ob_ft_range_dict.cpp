@@ -302,13 +302,21 @@ int ObFTRangeDict::build_one_range(const ObFTDictDesc &desc,
 
 int ObFTRangeDict::init()
 {
+  return init(false);
+}
+
+int ObFTRangeDict::init(bool copy_cache_data)
+{
   int ret = OB_SUCCESS;
   if (is_inited_) {
     ret = OB_INIT_TWICE;
   } else {
-    if (OB_FAIL(build_dict_from_cache(*range_container_))) {
+    if (copy_cache_data) {
+      range_alloc_.set_attr(lib::ObMemAttr("FTDictShared"));
     }
-    is_inited_ = true;
+    if (OB_FAIL(build_dict_from_cache(*range_container_, copy_cache_data))) {
+    }
+    is_inited_ = OB_SUCC(ret);
   }
   return ret;
 }
@@ -402,7 +410,7 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
   return ret;
 }
 
-int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
+int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container, bool copy_cache_data)
 {
   int ret = OB_SUCCESS;
   for (ObList<ObFTCacheRangeHandle *, ObIAllocator>::const_iterator iter = range_container.get_handles().begin();
@@ -411,7 +419,17 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
     ObFTCacheRangeHandle *ptr = *iter;
     ObFTCacheDict *dict = nullptr;
     ObFTDAT *dat = ptr->value_->dat_block_;
-    if (OB_ISNULL(dict = OB_NEWx(ObFTCacheDict, &range_alloc_, ObCollationType::CS_TYPE_UTF8MB4_BIN, dat))) {
+    if (copy_cache_data) {
+      ObFTDAT *owned = static_cast<ObFTDAT *>(range_alloc_.alloc(dat->mem_block_size_));
+      if (OB_ISNULL(owned)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        MEMCPY(owned, dat, dat->mem_block_size_);
+        dat = owned;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(dict = OB_NEWx(ObFTCacheDict, &range_alloc_, ObCollationType::CS_TYPE_UTF8MB4_BIN, dat))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
       ObFTRange range;

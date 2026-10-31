@@ -42,7 +42,7 @@ public:
         range_dicts_(&range_alloc_), range_container_(range_container)
   {
   }
-  ~ObFTRangeDict() override{};
+  ~ObFTRangeDict() override { destroy(); }
 
 public:
   struct ObFTRange final
@@ -54,6 +54,7 @@ public:
 
 public:
   int init() override;
+  int init(bool copy_cache_data);
   int match(const ObString &single_word, ObDATrieHit &hit) const override;
   int match(const ObString &words, bool &is_match) const override;
   int match_with_hit(const ObString &single_word,
@@ -61,7 +62,7 @@ public:
                      ObDATrieHit &hit) const override;
 
 public:
-  int build_dict_from_cache(const ObFTCacheRangeContainer &range_container);
+  int build_dict_from_cache(const ObFTCacheRangeContainer &range_container, bool copy_cache_data = false);
 
   static int try_load_cache(const ObFTDictDesc &desc,
                             const uint32_t range_count,

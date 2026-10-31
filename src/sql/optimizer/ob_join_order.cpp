@@ -46,6 +46,48 @@ class QueryRangeInfo;
 
 ERRSIM_POINT_DEF(EN_FORCE_INDEX_MERGE_PLAN, "Force to use index merge if it is possible");
 
+// MATCH columns identify the inverted index; their original text is not read
+// by retrieval. Keep actual consumers, including dynamic query text, separate
+// when deciding whether the index covers the statement.
+static int collect_fts_data_column_ids(const ObDMLStmt &stmt, uint64_t table_id,
+                                     ObIArray<uint64_t> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr *, 16> roots;
+  ObSEArray<const ObRawExpr *, 32> pending;
+  if (OB_FAIL(stmt.get_relation_exprs(roots))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < roots.count(); ++i) {
+    ret = pending.push_back(roots.at(i));
+  }
+  while (OB_SUCC(ret) && !pending.empty()) {
+    const ObRawExpr *expr = pending.at(pending.count() - 1);
+    pending.pop_back();
+    if (OB_ISNULL(expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (expr->is_match_against_expr()) {
+      const auto *match = static_cast<const ObMatchFunRawExpr *>(expr);
+      if (OB_FAIL(pending.push_back(match->get_search_key()))) {
+      } else if (nullptr != match->get_param_text_expr()) {
+        ret = pending.push_back(match->get_param_text_expr());
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < match->get_columns_boosts().count(); ++i) {
+        ret = pending.push_back(match->get_columns_boosts().at(i));
+      }
+    } else if (expr->is_column_ref_expr()) {
+      const auto *column = static_cast<const ObColumnRefRawExpr *>(expr);
+      if (column->get_table_id() == table_id) {
+        ret = add_var_to_array_no_dup(column_ids, column->get_column_id());
+      }
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < expr->get_param_count(); ++i) {
+        ret = pending.push_back(expr->get_param_expr(i));
+      }
+    }
+  }
+  return ret;
+}
+
 ObJoinOrder::~ObJoinOrder()
 {
 
@@ -12598,6 +12640,25 @@ int ObJoinOrder::get_simple_index_info(const uint64_t table_id,
                                           column_ids,
                                           dummy_columns))) {
   } else if (index_id != ref_table_id) {
+    if (index_schema->is_fts_index_aux() && stmt->is_select_stmt()
+        && !stmt->has_subquery()
+        && !static_cast<const ObSelectStmt *>(stmt)->has_window_function()
+        && stmt->get_match_exprs().count() == 1
+        && stmt->get_match_exprs().at(0)->get_mode_flag() == NATURAL_LANGUAGE_MODE
+        && !stmt->get_match_exprs().at(0)->is_es_match()) {
+      ObSEArray<uint64_t, 16> data_column_ids;
+      ObSEArray<uint64_t, 16> filtered_column_ids;
+      if (OB_FAIL(collect_fts_data_column_ids(*stmt, table_id, data_column_ids))) {
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < column_ids.count(); ++i) {
+        if (ObOptimizerUtil::find_item(data_column_ids, column_ids.at(i))) {
+          ret = filtered_column_ids.push_back(column_ids.at(i));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ret = column_ids.assign(filtered_column_ids);
+      }
+    }
     is_unique_index = index_schema->is_unique_index();
     is_index_global = index_schema->is_global_index_table();
     is_index_back = index_schema->is_spatial_index() ? true : false;
@@ -16711,7 +16772,7 @@ int ObJoinOrder::get_query_tokens(ObMatchFunRawExpr *match_expr,
     const ObObjMeta &key_meta = match_expr->get_search_key()->get_result_meta();
     storage::ObFTParseHelper tokenize_helper;
     common::ObSEArray<ObFTWord, 16> tokens;
-    hash::ObHashMap<ObFTWord, int64_t> token_map;
+    storage::ObFTWordMap token_map;
     int64_t doc_length = 0;
     const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
     if (search_text_string.length() == 0) {
@@ -16725,7 +16786,7 @@ int ObJoinOrder::get_query_tokens(ObMatchFunRawExpr *match_expr,
                            doc_length,
                            token_map))) {
     } else {
-      for (hash::ObHashMap<ObFTWord, int64_t>::const_iterator iter = token_map.begin();
+      for (storage::ObFTWordMap::const_iterator iter = token_map.begin();
           OB_SUCC(ret) && iter != token_map.end();
           ++iter) {
         const ObFTWord &token = iter->first;

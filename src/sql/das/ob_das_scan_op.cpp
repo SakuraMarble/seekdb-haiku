@@ -1016,6 +1016,9 @@ int ObDASScanOp::get_fts_tablet_ids(common::ObIArray<ObDASFTSTabletID> &fts_tabl
   } else if (DAS_OP_IR_SCAN == rtdef->op_type_) {
     ObDASIRScanRtDef *ir_rtdef = static_cast<ObDASIRScanRtDef *>(rtdef);
     ObDASFTSTabletID fts_tablet_id;
+    if (ir_rtdef->get_inv_idx_scan_rtdef() == scan_rtdef_) {
+      fts_tablet_id.inv_idx_tablet_id_ = tablet_id_;
+    }
     for (int64_t i = 0; OB_SUCC(ret) && i < related_rtdefs_.count(); ++i) {
       if (ir_rtdef->get_inv_idx_agg_rtdef() == related_rtdefs_.at(i) ||
           ir_rtdef->get_inv_idx_scan_rtdef() == related_rtdefs_.at(i)) {
